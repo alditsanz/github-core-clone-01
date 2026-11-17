@@ -21,6 +21,9 @@ const VIEWER_EMAIL = 'adaiversen@example.invalid';
 const VIEWER_IDENTITY = `${VIEWER_NAME} <${VIEWER_EMAIL}>`;
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const JSON_TYPE = 'application/json; charset=utf-8';
+const TS = '2023-11-14T22:13:20Z'; // fixed timestamp: every served date is this value
+const userJson = (): Record<string, unknown> => ({ login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' });
+const actorJson = (): Record<string, unknown> => ({ name: VIEWER_NAME, email: VIEWER_EMAIL, date: TS });
 
 // ---------------------------------------------------------------- git primitives
 
@@ -76,15 +79,22 @@ function buildTree(entries: readonly TreeEntry[]): Buffer {
   return Buffer.concat(parts);
 }
 
-function parseCommit(data: Buffer): CommitView {
+/** Split a git object into its `key value` header lines and its message body. */
+function splitObject(data: Buffer): { lines: string[]; message: string } {
   const blank = data.indexOf('\n\n');
-  const headerEnd = blank < 0 ? data.length : blank;
-  const message = blank < 0 ? '' : data.subarray(blank + 2).toString('utf8');
+  return {
+    lines: data.subarray(0, blank < 0 ? data.length : blank).toString('utf8').split('\n'),
+    message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8'),
+  };
+}
+
+function parseCommit(data: Buffer): CommitView {
+  const { lines, message } = splitObject(data);
   let tree = '';
   const parents: string[] = [];
   let author = '';
   let committer = '';
-  for (const line of data.subarray(0, headerEnd).toString('utf8').split('\n')) {
+  for (const line of lines) {
     if (!line) continue;
     const space = line.indexOf(' ');
     const key = space < 0 ? line : line.slice(0, space);
@@ -98,10 +108,9 @@ function parseCommit(data: Buffer): CommitView {
 }
 
 function parseTag(data: Buffer): TagView {
-  const blank = data.indexOf('\n\n');
-  const headerEnd = blank < 0 ? data.length : blank;
+  const { lines, message } = splitObject(data);
   const headers = new Map<string, string>();
-  for (const line of data.subarray(0, headerEnd).toString('utf8').split('\n')) {
+  for (const line of lines) {
     if (!line) continue;
     const space = line.indexOf(' ');
     if (space < 0) continue;
@@ -113,7 +122,7 @@ function parseTag(data: Buffer): TagView {
     type: type === 'commit' || type === 'tree' || type === 'blob' || type === 'tag' ? type : 'commit',
     tag: headers.get('tag') ?? '',
     tagger: headers.get('tagger') ?? '',
-    message: blank < 0 ? '' : data.subarray(blank + 2).toString('utf8'),
+    message,
   };
 }
 
@@ -125,13 +134,8 @@ function buildCommit(tree: string, parents: readonly string[], message: string, 
   return Buffer.from(`${lines.join('\n')}\n${msg}`, 'utf8');
 }
 
-function buildTag(object: string, type: GitObjectType, tag: string, message: string, tagger: string, timestamp: number): Buffer {
-  const msg = message.endsWith('\n') ? message : `${message}\n`;
-  return Buffer.from(`object ${object}\ntype ${type}\ntag ${tag}\ntagger ${tagger} ${timestamp} +0000\n\n${msg}`, 'utf8');
-}
-
 /** Every object id reachable from `roots` (commits, trees, blobs, tags), in visit order. */
-function collectReachable(roots: Iterable<string>, lookup: (oid: string) => GitObject | undefined, allowMissing = false): Set<string> {
+function collectReachable(roots: Iterable<string>, lookup: (oid: string) => GitObject | undefined, allowMissing = false, skipParents?: ReadonlySet<string>): Set<string> {
   const seen = new Set<string>();
   const stack: string[] = [...roots];
   while (stack.length > 0) {
@@ -146,7 +150,7 @@ function collectReachable(roots: Iterable<string>, lookup: (oid: string) => GitO
     if (object.type === 'commit') {
       const commit = parseCommit(object.data);
       stack.push(commit.tree);
-      for (const parent of commit.parents) stack.push(parent);
+      if (!skipParents?.has(oid)) for (const parent of commit.parents) stack.push(parent);
     } else if (object.type === 'tree') {
       for (const entry of parseTree(object.data)) stack.push(entry.oid);
     } else if (object.type === 'tag') {
@@ -209,20 +213,26 @@ function encodePktLines(items: readonly (string | Buffer | 'flush' | 'delim' | '
 
 type Pkt = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' } | { kind: 'response-end' };
 
+/** Read one pkt-line header; returns its length and the offset after the header. */
+function pktLength(bytes: Buffer, offset: number): { length: number; next: number } {
+  if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
+  const header = bytes.subarray(offset, offset + 4).toString('ascii');
+  if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('bad pkt-line header');
+  return { length: parseInt(header, 16), next: offset + 4 };
+}
+
 function decodePktLines(bytes: Buffer): Pkt[] {
   const packets: Pkt[] = [];
   let offset = 0;
   while (offset < bytes.length) {
-    if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
-    const header = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('bad pkt-line header');
-    const length = parseInt(header, 16);
-    if (length === 0) { packets.push({ kind: 'flush' }); offset += 4; continue; }
-    if (length === 1) { packets.push({ kind: 'delim' }); offset += 4; continue; }
-    if (length === 2) { packets.push({ kind: 'response-end' }); offset += 4; continue; }
-    if (length < 4 || offset + length > bytes.length) throw new Error('truncated pkt-line');
-    packets.push({ kind: 'data', payload: Buffer.from(bytes.subarray(offset + 4, offset + length)) });
-    offset += length;
+    const { length, next } = pktLength(bytes, offset);
+    offset = next;
+    if (length === 0) { packets.push({ kind: 'flush' }); continue; }
+    if (length === 1) { packets.push({ kind: 'delim' }); continue; }
+    if (length === 2) { packets.push({ kind: 'response-end' }); continue; }
+    if (length < 4 || offset + length - 4 > bytes.length) throw new Error('truncated pkt-line');
+    packets.push({ kind: 'data', payload: Buffer.from(bytes.subarray(offset, offset + length - 4)) });
+    offset += length - 4;
   }
   return packets;
 }
@@ -534,8 +544,6 @@ function storeObject(repo: Repo, type: GitObjectType, data: Buffer): string {
   return oid;
 }
 
-function resolveRef(repo: Repo, ref: string): string | undefined { return repo.refs.get(ref); }
-
 /** Resolve a branch name, full ref, or raw oid to a commit oid (tags peeled). */
 function resolveRefish(repo: Repo, refish: string): string | undefined {
   if (isObjectId(refish)) {
@@ -669,6 +677,34 @@ function ungid(value: string): { kind: string; payload: string } | undefined {
   }
 }
 
+function findRepo(id: number): Repo | undefined {
+  return [...store.repos.values()].find((candidate) => candidate.id === id);
+}
+
+/** A repo resolved from its global id, or undefined. */
+function gidRepo(value: unknown): Repo | undefined {
+  const decoded = typeof value === 'string' ? ungid(value) : undefined;
+  return decoded?.kind === 'Repository' ? findRepo(parseInt(decoded.payload, 10)) : undefined;
+}
+
+function gidIssue(value: unknown): { repo: Repo; issue: Issue } | undefined {
+  const decoded = typeof value === 'string' ? ungid(value) : undefined;
+  if (decoded?.kind !== 'Issue') return undefined;
+  const [repoId, number] = decoded.payload.split(':').map(Number);
+  const repo = findRepo(repoId!);
+  const issue = repo?.issues.get(number!);
+  return repo && issue ? { repo, issue } : undefined;
+}
+
+function gidPull(value: unknown): { repo: Repo; pull: Pull } | undefined {
+  const decoded = typeof value === 'string' ? ungid(value) : undefined;
+  if (decoded?.kind !== 'PullRequest') return undefined;
+  const [repoId, number] = decoded.payload.split(':').map(Number);
+  const repo = findRepo(repoId!);
+  const pull = repo?.pulls.get(number!);
+  return repo && pull ? { repo, pull } : undefined;
+}
+
 // ---------------------------------------------------------------- REST serializers
 
 function repoJson(repo: Repo): Record<string, unknown> {
@@ -677,7 +713,7 @@ function repoJson(repo: Repo): Record<string, unknown> {
     node_id: repoGid(repo),
     name: repo.name,
     full_name: `${VIEWER_LOGIN}/${repo.name}`,
-    owner: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+    owner: userJson(),
     private: repo.isPrivate,
     description: repo.description,
     default_branch: repo.defaultBranch,
@@ -687,9 +723,9 @@ function repoJson(repo: Repo): Record<string, unknown> {
     clone_url: `https://github.example/${VIEWER_LOGIN}/${repo.name}.git`,
     git_url: `git://github.example/${VIEWER_LOGIN}/${repo.name}.git`,
     ssh_url: `git@github.example:${VIEWER_LOGIN}/${repo.name}.git`,
-    created_at: '2023-11-14T22:13:20Z',
-    updated_at: '2023-11-14T22:13:20Z',
-    pushed_at: '2023-11-14T22:13:20Z',
+    created_at: TS,
+    updated_at: TS,
+    pushed_at: TS,
     size: 0,
     stargazers_count: 0,
     watchers_count: 0,
@@ -716,13 +752,13 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+    user: userJson(),
     labels: issue.labels.map((name) => ({ name, color: repo.labels.get(name)?.color ?? '000000' })),
     assignees: [],
     comments: (repo.comments.get(issue.number) ?? []).length,
-    created_at: '2023-11-14T22:13:20Z',
-    updated_at: '2023-11-14T22:13:20Z',
-    closed_at: issue.state === 'closed' ? '2023-11-14T22:13:20Z' : null,
+    created_at: TS,
+    updated_at: TS,
+    closed_at: issue.state === 'closed' ? TS : null,
     html_url: `https://github.example/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
     repository_url: `/api/v3/repos/${VIEWER_LOGIN}/${repo.name}`,
@@ -736,9 +772,9 @@ function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<st
     id: comment.id,
     node_id: commentGid(repo, issue, comment),
     body: comment.body,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-    created_at: '2023-11-14T22:13:20Z',
-    updated_at: '2023-11-14T22:13:20Z',
+    user: userJson(),
+    created_at: TS,
+    updated_at: TS,
     html_url: `https://github.example/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}#issuecomment-${comment.id}`,
     issue_url: `/api/v3/repos/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
     author_association: 'OWNER',
@@ -754,7 +790,7 @@ function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
     body: pull.body,
     state: pull.state,
     locked: false,
-    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+    user: userJson(),
     head: { label: `${VIEWER_LOGIN}:${pull.headRef}`, ref: pull.headRef, sha: pull.headSha },
     base: { label: `${VIEWER_LOGIN}:${pull.baseRef}`, ref: pull.baseRef, sha: pull.baseSha },
     merged: pull.merged,
@@ -763,9 +799,9 @@ function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
     merged_at: pull.merged ? pull.mergedAt : null,
     html_url: `https://github.example/${VIEWER_LOGIN}/${repo.name}/pull/${pull.number}`,
     url: `/api/v3/repos/${VIEWER_LOGIN}/${repo.name}/pulls/${pull.number}`,
-    created_at: '2023-11-14T22:13:20Z',
-    updated_at: '2023-11-14T22:13:20Z',
-    closed_at: pull.state === 'closed' ? '2023-11-14T22:13:20Z' : null,
+    created_at: TS,
+    updated_at: TS,
+    closed_at: pull.state === 'closed' ? TS : null,
     author_association: 'OWNER',
   };
 }
@@ -867,29 +903,24 @@ function v0RefLines(repo: Repo, caps: string): Buffer {
   return Buffer.concat(lines);
 }
 
-function uploadPackAdvertisement(repo: Repo, wantsV2: boolean): { body: Buffer; type: string } {
-  if (wantsV2) {
+/** The info/refs advertisement for a git service (v2 only for upload-pack). */
+function advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', caps: string, v2 = false): { body: Buffer; type: string } {
+  if (v2) {
     return {
-      body: encodePktLines([
-        'version 2\n',
-        `agent=${AGENT}\n`,
-        'ls-refs=unborn\n',
-        'fetch=shallow filter\n',
-        'object-format=sha1\n',
-        'flush',
-      ]),
+      body: encodePktLines(['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow filter\n', 'object-format=sha1\n', 'flush']),
       type: 'application/x-git-upload-pack-advertisement',
     };
   }
-  const preamble = encodePktLines(['# service=git-upload-pack\n', 'flush']);
-  const refs = v0RefLines(repo, 'side-band-64k ofs-delta shallow thin-pack agent=forge/1.0');
-  return { body: Buffer.concat([preamble, refs]), type: 'application/x-git-upload-pack-advertisement' };
+  const preamble = encodePktLines([`# service=${service}\n`, 'flush']);
+  return { body: Buffer.concat([preamble, v0RefLines(repo, caps)]), type: `application/x-${service}-advertisement` };
+}
+
+function uploadPackAdvertisement(repo: Repo, wantsV2: boolean): { body: Buffer; type: string } {
+  return advertisement(repo, 'git-upload-pack', 'side-band-64k ofs-delta shallow thin-pack agent=forge/1.0', wantsV2);
 }
 
 function receivePackAdvertisement(repo: Repo): { body: Buffer; type: string } {
-  const preamble = encodePktLines(['# service=git-receive-pack\n', 'flush']);
-  const refs = v0RefLines(repo, 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0');
-  return { body: Buffer.concat([preamble, refs]), type: 'application/x-git-receive-pack-advertisement' };
+  return advertisement(repo, 'git-receive-pack', 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0');
 }
 
 interface LsRefsArgs { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }
@@ -958,38 +989,7 @@ function fetchSelection(
     }
   }
   // Closure of haves, stopping at the shallow boundary (parents of a shallow commit stay hidden).
-  const held = new Set<string>();
-  {
-    const stack: string[] = args.haves.map((oid) => peelToCommit(oid, lookup));
-    const seen = new Set<string>();
-    while (stack.length > 0) {
-      const oid = stack.pop()!;
-      if (seen.has(oid) || oid === ZERO_OID) continue;
-      seen.add(oid);
-      const object = lookup(oid);
-      if (!object) continue;
-      if (object.type === 'commit') {
-        held.add(oid);
-        if (!shallowSet.has(oid)) {
-          const commit = parseCommit(object.data);
-          stack.push(commit.tree);
-          for (const parent of commit.parents) stack.push(parent);
-        } else {
-          // A shallow commit's tree is already held; only its parents are hidden.
-          const commit = parseCommit(object.data);
-          stack.push(commit.tree);
-        }
-      } else if (object.type === 'tree') {
-        held.add(oid);
-        for (const entry of parseTree(object.data)) stack.push(entry.oid);
-      } else if (object.type === 'tag') {
-        held.add(oid);
-        stack.push(parseTag(object.data).object);
-      } else {
-        held.add(oid);
-      }
-    }
-  }
+  const held = collectReachable(args.haves.map((oid) => peelToCommit(oid, lookup)), lookup, true, shallowSet);
   // Send each included commit plus its own tree closure only. A full closure over the
   // included set would follow parents and defeat depth limits, so the tree walk is
   // per-commit (trees reach only trees and blobs, never commits).
@@ -1074,20 +1074,18 @@ function handleReceivePack(repo: Repo, body: Buffer): ReceivePackResult {
   let offset = 0;
   let sawFlush = false;
   while (offset < body.length) {
-    if (offset + 4 > body.length) throw new Error('truncated pkt-line header');
-    const header = body.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('bad pkt-line header');
-    const length = parseInt(header, 16);
-    if (length === 0) { offset += 4; sawFlush = true; break; }
-    if (length < 4 || offset + length > body.length) throw new Error('truncated pkt-line');
-    const text = body.subarray(offset + 4, offset + length).toString('utf8');
+    const { length, next } = pktLength(body, offset);
+    offset = next;
+    if (length === 0) { sawFlush = true; break; }
+    if (length < 4 || offset + length - 4 > body.length) throw new Error('truncated pkt-line');
+    const text = body.subarray(offset, offset + length - 4).toString('utf8');
     const line = text.includes('\u0000') ? text.slice(0, text.indexOf('\u0000')) : text;
     const parts = line.trim().split(' ');
     if (parts.length !== 3 || !isObjectId(parts[0]!) || !isObjectId(parts[1]!)) {
       throw new Error('receive-pack command is not <old> <new> <ref>');
     }
     commands.push({ old: parts[0]!, next: parts[1]!, ref: parts[2]! });
-    offset += length;
+    offset += length - 4;
   }
   if (!sawFlush) throw new Error('receive-pack body has no flush pkt-line');
   const packBytes = body.subarray(offset);
@@ -1178,15 +1176,19 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function sendJson(ctx: ReqCtx, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
-  const text = JSON.stringify(value);
-  const headers: Record<string, string> = {
-    'content-type': JSON_TYPE,
-    'content-length': String(Buffer.byteLength(text)),
-    'x-github-request-id': ctx.requestId,
-    ...extraHeaders,
-  };
-  ctx.res.writeHead(status, headers);
-  ctx.res.end(text);
+  sendBytes(ctx, status, Buffer.from(JSON.stringify(value), 'utf8'), JSON_TYPE, extraHeaders);
+}
+
+function sendEmpty(ctx: ReqCtx, status: number): void {
+  ctx.res.writeHead(status, { 'x-github-request-id': ctx.requestId });
+  ctx.res.end();
+}
+
+/** Parse the request JSON body; on failure the 400 is already sent and the result is undefined. */
+function jsonBody(ctx: ReqCtx): Record<string, unknown> | undefined {
+  const parsed = parseJsonBody(ctx);
+  if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return undefined; }
+  return asRecord(parsed.value);
 }
 
 function sendBytes(ctx: ReqCtx, status: number, body: Buffer, contentType: string, extraHeaders: Record<string, string> = {}): void {
@@ -1208,9 +1210,7 @@ function isAuthed(ctx: ReqCtx): boolean {
   const header = ctx.req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length);
-  if (!token) return false;
-  if (TOKEN === '') return true;
-  return token === TOKEN;
+  return token !== '' && (TOKEN === '' || token === TOKEN);
 }
 
 function requireAuth(ctx: ReqCtx): boolean {
@@ -1256,6 +1256,12 @@ function paginate<T>(items: readonly T[], page: number, perPage: number): T[] {
   return items.slice((page - 1) * perPage, page * perPage);
 }
 
+/** Send one page of `items` as JSON, with Link headers. */
+function sendList<T>(ctx: ReqCtx, items: readonly T[], map: (item: T) => unknown = (item) => item): void {
+  const { page, perPage } = pageParams(ctx);
+  sendJson(ctx, 200, paginate(items, page, perPage).map(map), pagination(ctx, items.length, page, perPage));
+}
+
 // ---------------------------------------------------------------- REST v3
 
 function handleRest(ctx: ReqCtx): void {
@@ -1263,9 +1269,6 @@ function handleRest(ctx: ReqCtx): void {
   if (first === 'api' && rest[0] === 'v3') return handleV3(ctx, rest.slice(1));
   if (first === 'api' && rest[0] === 'graphql') return handleGraphql(ctx);
   if (first === 'mcp') return handleMcp(ctx);
-  if (rest.length > 0 && rest[0] === 'git') {
-    // /api/v3/repos/{owner}/{repo}/git/... handled inside handleV3; anything else here is unknown.
-  }
   sendError(ctx, 404, 'Not Found');
 }
 
@@ -1324,22 +1327,20 @@ function handleV3(ctx: ReqCtx, segments: readonly string[]): void {
       url: '/api/v3/user', html_url: `https://github.example/${VIEWER_LOGIN}`,
       type: 'User', site_admin: false, name: VIEWER_NAME, email: VIEWER_EMAIL,
       company: null, blog: '', location: '', bio: '', public_repos: store.repos.size,
-      followers: 0, following: 0, created_at: '2023-11-14T22:13:20Z', updated_at: '2023-11-14T22:13:20Z',
+      followers: 0, following: 0, created_at: TS, updated_at: TS,
     });
     return;
   }
   if (segments.length === 2 && segments[0] === 'user' && segments[1] === 'repos') {
     if (!requireAuth(ctx)) return;
     if (ctx.method === 'GET') {
-      const { page, perPage } = pageParams(ctx);
       const all = [...store.repos.values()].sort((a, b) => a.createdSeq - b.createdSeq);
-      sendJson(ctx, 200, paginate(all, page, perPage).map(repoJson), pagination(ctx, all.length, page, perPage));
+      sendList(ctx, all, repoJson);
       return;
     }
     if (ctx.method === 'POST') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const name = typeof body.name === 'string' ? body.name : '';
       if (!name || !/^[A-Za-z0-9._-]+$/.test(name)) { sendError(ctx, 422, 'Validation Failed: name is required'); return; }
       if (store.repos.has(name)) { sendError(ctx, 422, `name already exists on this account`); return; }
@@ -1364,9 +1365,8 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
   if (rest.length === 0) {
     if (ctx.method === 'GET') { sendJson(ctx, 200, repoJson(repo)); return; }
     if (ctx.method === 'PATCH') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       if (typeof body.description === 'string') repo.description = body.description;
       if (typeof body.private === 'boolean') repo.isPrivate = body.private;
       repo.updatedSeq = nextSeq();
@@ -1375,8 +1375,7 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
     }
     if (ctx.method === 'DELETE') {
       deleteRepo(name!);
-      ctx.res.writeHead(204, { 'x-github-request-id': ctx.requestId });
-      ctx.res.end();
+      sendEmpty(ctx, 204);
       return;
     }
     sendError(ctx, 404, 'Not Found');
@@ -1412,9 +1411,8 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
   }
   if (section === 'git') {
     if (tail[0] === 'refs' && ctx.method === 'POST' && tail.length === 1) {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const ref = typeof body.ref === 'string' ? body.ref : '';
       const sha = typeof body.sha === 'string' ? body.sha : '';
       if (!ref.startsWith('refs/') || !isObjectId(sha)) { sendError(ctx, 422, 'Validation Failed: ref and sha are required'); return; }
@@ -1441,7 +1439,6 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
       const refish = ctx.query.get('sha');
       const tip = refish ? resolveRefish(repo, refish) : repo.refs.get(`refs/heads/${repo.defaultBranch}`);
       if (!tip) { sendJson(ctx, 200, []); return; }
-      const { page, perPage } = pageParams(ctx);
       const commits = commitsFromTip(repo, tip);
       const listed = commits.map(({ oid, commit }) => {
         return {
@@ -1450,19 +1447,19 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
           commit: {
             // GitHub strips the object's trailing newline in the API view.
             message: commit.message.endsWith('\n') ? commit.message.slice(0, -1) : commit.message,
-            author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' },
-            committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' },
+            author: actorJson(),
+            committer: actorJson(),
             tree: { sha: commit.tree },
             verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
           },
-          author: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
-          committer: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+          author: userJson(),
+          committer: userJson(),
           parents: commit.parents.map((parent) => ({ sha: parent })),
           url: `/api/v3/repos/${owner}/${name}/commits/${oid}`,
           html_url: `https://github.example/${owner}/${name}/commit/${oid}`,
         };
       });
-      sendJson(ctx, 200, paginate(listed, page, perPage), pagination(ctx, listed.length, page, perPage));
+      sendList(ctx, listed);
       return;
     }
     sendError(ctx, 404, 'Not Found');
@@ -1477,9 +1474,8 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
       return;
     }
     if (ctx.method === 'POST' && tail.length === 0) {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const labelName = typeof body.name === 'string' ? body.name : '';
       const color = typeof body.color === 'string' ? body.color.replace(/^#/, '') : '000000';
       if (!labelName) { sendError(ctx, 422, 'Validation Failed: name is required'); return; }
@@ -1498,6 +1494,10 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
     return handlePulls(ctx, repo, owner!, name!, tail);
   }
   sendError(ctx, 404, 'Not Found');
+}
+
+function commitJson(repo: Repo, owner: string, name: string, oid: string, message: string, treeOid: string): Record<string, unknown> {
+  return { sha: oid, message, author: actorJson(), committer: actorJson(), url: `/api/v3/repos/${owner}/${name}/commits/${oid}`, tree: { sha: treeOid } };
 }
 
 function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail: readonly string[]): void {
@@ -1553,9 +1553,8 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
     return;
   }
   if (ctx.method === 'PUT') {
-    const parsed = parseJsonBody(ctx);
-    if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-    const body = asRecord(parsed.value);
+    const body = jsonBody(ctx);
+    if (!body) return;
     const message = typeof body.message === 'string' && body.message ? body.message : `Update ${path}`;
     const contentBase64 = typeof body.content === 'string' ? body.content : '';
     let content: Buffer;
@@ -1582,14 +1581,13 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
     repo.refs.set(`refs/heads/${branch}`, commitOid);
     sendJson(ctx, isCreate ? 201 : 200, {
       content: { name: path.split('/').pop() ?? path, path, sha: blobOid, size: content.length, url: `/api/v3/repos/${owner}/${name}/contents/${path}`, html_url: `https://github.example/${owner}/${name}/blob/${branch}/${path}`, git_url: `/api/v3/repos/${owner}/${name}/git/blobs/${blobOid}`, download_url: `https://github.example/${owner}/${name}/raw/${branch}/${path}`, type: 'file', encoding: 'base64' },
-      commit: { sha: commitOid, message, author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' }, committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' }, url: `/api/v3/repos/${owner}/${name}/commits/${commitOid}`, tree: { sha: treeOid } },
+      commit: commitJson(repo, owner, name, commitOid, message, treeOid),
     });
     return;
   }
   if (ctx.method === 'DELETE') {
-    const parsed = parseJsonBody(ctx);
-    if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-    const body = asRecord(parsed.value);
+    const body = jsonBody(ctx);
+    if (!body) return;
     const message = typeof body.message === 'string' && body.message ? body.message : `Delete ${path}`;
     const branch = typeof body.branch === 'string' && body.branch ? body.branch : repo.defaultBranch;
     const tip = repo.refs.get(`refs/heads/${branch}`);
@@ -1604,7 +1602,7 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
     const commitOid = createCommit(repo, treeOid, [tip], message);
     repo.refs.set(`refs/heads/${branch}`, commitOid);
     sendJson(ctx, 200, {
-      commit: { sha: commitOid, message, author: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' }, committer: { name: VIEWER_NAME, email: VIEWER_EMAIL, date: '2023-11-14T22:13:20Z' }, url: `/api/v3/repos/${owner}/${name}/commits/${commitOid}`, tree: { sha: treeOid } },
+      commit: commitJson(repo, owner, name, commitOid, message, treeOid),
     });
     return;
   }
@@ -1638,14 +1636,12 @@ function handleIssues(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail
       if (sort === 'created') {
         list.sort((a, b) => direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq);
       }
-      const { page, perPage } = pageParams(ctx);
-      sendJson(ctx, 200, paginate(list, page, perPage).map((issue) => issueJson(repo, issue)), pagination(ctx, list.length, page, perPage));
+      sendList(ctx, list, (issue) => issueJson(repo, issue));
       return;
     }
     if (ctx.method === 'POST') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const title = typeof body.title === 'string' ? body.title : '';
       if (!title) { sendError(ctx, 422, 'Validation Failed: title is required'); return; }
       const labels = Array.isArray(body.labels) ? body.labels.filter((label): label is string => typeof label === 'string') : [];
@@ -1664,9 +1660,8 @@ function handleIssues(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail
   if (tail.length === 1) {
     if (ctx.method === 'GET') { sendJson(ctx, 200, issueJson(repo, issue)); return; }
     if (ctx.method === 'PATCH') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
@@ -1684,15 +1679,13 @@ function handleIssues(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail
   }
   if (tail.length === 2 && tail[1] === 'comments') {
     if (ctx.method === 'GET') {
-      const { page, perPage } = pageParams(ctx);
       const all = repo.comments.get(number) ?? [];
-      sendJson(ctx, 200, paginate(all, page, perPage).map((comment) => commentJson(repo, issue, comment)), pagination(ctx, all.length, page, perPage));
+      sendList(ctx, all, (comment) => commentJson(repo, issue, comment));
       return;
     }
     if (ctx.method === 'POST') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const commentBody = typeof body.body === 'string' ? body.body : '';
       if (!commentBody) { sendError(ctx, 422, 'Validation Failed: body is required'); return; }
       const comment: IssueComment = { id: repo.nextComment++, body: commentBody, createdSeq: nextSeq() };
@@ -1747,7 +1740,7 @@ function mergePullInternal(repo: Repo, pull: Pull, method: string): { sha?: stri
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeCommit);
   pull.state = 'closed';
   pull.merged = true;
-  pull.mergedAt = '2023-11-14T22:13:20Z';
+  pull.mergedAt = TS;
   pull.mergeCommitSha = mergeCommit;
   pull.updatedSeq = nextSeq();
   return { sha: mergeCommit };
@@ -1760,14 +1753,12 @@ function handlePulls(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail:
       let list = [...repo.pulls.values()];
       if (state !== 'all') list = list.filter((pull) => pull.state === state);
       list.sort((a, b) => b.createdSeq - a.createdSeq);
-      const { page, perPage } = pageParams(ctx);
-      sendJson(ctx, 200, paginate(list, page, perPage).map((pull) => pullJson(repo, pull)), pagination(ctx, list.length, page, perPage));
+      sendList(ctx, list, (pull) => pullJson(repo, pull));
       return;
     }
     if (ctx.method === 'POST') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const head = typeof body.head === 'string' ? body.head : '';
       const base = typeof body.base === 'string' ? body.base : '';
       const title = typeof body.title === 'string' ? body.title : '';
@@ -1799,9 +1790,8 @@ function handlePulls(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail:
   }
   if (tail.length === 2 && tail[1] === 'merge') {
     if (ctx.method === 'PUT') {
-      const parsed = parseJsonBody(ctx);
-      if (!parsed.ok) { sendError(ctx, 400, 'Problems parsing JSON'); return; }
-      const body = asRecord(parsed.value);
+      const body = jsonBody(ctx);
+      if (!body) return;
       const method = typeof body.merge_method === 'string' ? body.merge_method : 'squash';
       const merged = mergePullInternal(repo, pull, method);
       if (merged.error) { sendError(ctx, merged.status ?? 405, merged.error); return; }
@@ -1926,7 +1916,7 @@ class GqlParser {
     if (match) {
       this.pos += match[0].length;
       const num = Number(match[0]);
-      return Number.isInteger(num) ? num : num;
+      return num;
     }
     const name = this.readName();
     if (name === 'true') return true;
@@ -2062,35 +2052,25 @@ class GqlParser {
 
 // ---------------------------------------------------------------- GraphQL schema surface
 
-const ISSUE_FIELDS = new Set(['id', 'number', 'title', 'state', 'body', 'createdAt', 'updatedAt', 'url', 'labels', 'comments']);
-const PR_FIELDS = new Set(['id', 'number', 'title', 'body', 'state', 'merged', 'headRefName', 'baseRefName', 'mergeable', 'files', 'headRef', 'baseRef', 'createdAt', 'mergedAt', 'url']);
-const REPO_FIELDS = new Set(['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest', 'description', 'private', 'createdAt', 'updatedAt', 'url']);
-const USER_FIELDS = new Set(['login', 'id', 'name', 'email', 'url']);
-const CONNECTION_FIELDS = new Set(['nodes', 'pageInfo', 'totalCount', 'edges']);
-const PAGEINFO_FIELDS = new Set(['hasNextPage', 'hasPreviousPage', 'endCursor', 'startCursor']);
-const CHANGED_FILE_FIELDS = new Set(['path', 'filename', 'additions', 'deletions', 'changes', 'status']);
-const COMMENT_FIELDS = new Set(['id', 'body', 'createdAt']);
-const TYPE_FIELDS = new Set(['name', 'kind', 'fields', 'enumValues', 'description']);
-const FIELD_FIELDS = new Set(['name', 'description', 'type']);
-const ENUM_FIELDS = new Set(['name', 'description']);
-const MUTATION_FIELDS = new Set(['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment']);
-
+/** Allowed field names per GraphQL type (validation + introspection). */
+const S = (...names: string[]): Set<string> => new Set(names);
 const SCHEMA_FIELDS: Record<string, Set<string>> = {
-  Query: new Set(['viewer', 'repository', 'node', '__type', '__schema', 'search']),
-  Mutation: MUTATION_FIELDS,
-  User: USER_FIELDS,
-  Repository: REPO_FIELDS,
-  Issue: ISSUE_FIELDS,
-  PullRequest: PR_FIELDS,
-  IssueConnection: CONNECTION_FIELDS,
-  PullRequestConnection: CONNECTION_FIELDS,
-  PullRequestChangedFileConnection: CONNECTION_FIELDS,
-  PullRequestChangedFile: CHANGED_FILE_FIELDS,
-  PageInfo: PAGEINFO_FIELDS,
-  IssueComment: COMMENT_FIELDS,
-  __Type: TYPE_FIELDS,
-  __Field: FIELD_FIELDS,
-  __EnumValue: ENUM_FIELDS,
+  Query: S('viewer', 'repository', 'node', '__type', '__schema', 'search'),
+  Mutation: S('createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'),
+  User: S('login', 'id', 'name', 'email', 'url'),
+  Repository: S('id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest', 'description', 'private', 'createdAt', 'updatedAt', 'url'),
+  Issue: S('id', 'number', 'title', 'state', 'body', 'createdAt', 'updatedAt', 'url', 'labels', 'comments'),
+  PullRequest: S('id', 'number', 'title', 'body', 'state', 'merged', 'headRefName', 'baseRefName', 'mergeable', 'files', 'headRef', 'baseRef', 'createdAt', 'mergedAt', 'url'),
+  IssueConnection: S('nodes', 'pageInfo', 'totalCount', 'edges'),
+  PullRequestConnection: S('nodes', 'pageInfo', 'totalCount', 'edges'),
+  PullRequestChangedFileConnection: S('nodes', 'pageInfo', 'totalCount', 'edges'),
+  PullRequestChangedFile: S('path', 'filename', 'additions', 'deletions', 'changes', 'status'),
+  PageInfo: S('hasNextPage', 'hasPreviousPage', 'endCursor', 'startCursor'),
+  IssueComment: S('id', 'body', 'createdAt'),
+  __Type: S('name', 'kind', 'fields', 'enumValues', 'description'),
+  __Field: S('name', 'description', 'type'),
+  __EnumValue: S('name', 'description'),
+  BranchRef: S('name', 'prefix', 'target'),
 };
 
 const SEARCH_TYPE_VALUES = ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION', 'COMMIT', 'CODE', 'TOPIC', 'PACKAGE', 'MILESTONE'];
@@ -2125,176 +2105,148 @@ function cursorNumber(cursor: string): number | undefined {
   } catch { return undefined; }
 }
 
-function gqlIssue(repo: Repo, issue: Issue, fields: GqlField[]): Record<string, unknown> {
+/** Resolve a GraphQL object's requested fields from a name -> thunk table. */
+function gqlOut(fields: GqlField[], typeName: string, values: Record<string, (field: GqlField) => unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const field of flattenFields(fields, 'Issue')) {
-    switch (field.name) {
-      case 'id': out[field.alias] = issueGid(repo, issue); break;
-      case 'number': out[field.alias] = issue.number; break;
-      case 'title': out[field.alias] = issue.title; break;
-      case 'body': out[field.alias] = issue.body; break;
-      case 'state': out[field.alias] = issue.state === 'open' ? 'OPEN' : 'CLOSED'; break;
-      case 'createdAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case 'updatedAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case 'url': out[field.alias] = `https://github.example/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`; break;
-      case 'labels': out[field.alias] = { nodes: issue.labels.map((name) => ({ name })) }; break;
-      case 'comments': out[field.alias] = { nodes: (repo.comments.get(issue.number) ?? []).map((comment) => gqlComment(repo, issue, comment, field.children)) }; break;
-      case '__typename': out[field.alias] = 'Issue'; break;
-      default: break;
-    }
+  for (const field of flattenFields(fields, typeName)) {
+    if (field.name === '__typename') { out[field.alias] = typeName; continue; }
+    const value = values[field.name];
+    if (value) out[field.alias] = value(field);
   }
   return out;
+}
+
+function gqlIssue(repo: Repo, issue: Issue, fields: GqlField[]): Record<string, unknown> {
+  return gqlOut(fields, 'Issue', {
+    id: () => issueGid(repo, issue),
+    number: () => issue.number,
+    title: () => issue.title,
+    body: () => issue.body,
+    state: () => (issue.state === 'open' ? 'OPEN' : 'CLOSED'),
+    createdAt: () => TS,
+    updatedAt: () => TS,
+    url: () => `https://github.example/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
+    labels: () => ({ nodes: issue.labels.map((name) => ({ name })) }),
+    comments: (field) => ({ nodes: (repo.comments.get(issue.number) ?? []).map((comment) => gqlComment(repo, issue, comment, field.children)) }),
+  });
 }
 
 function gqlComment(repo: Repo, issue: Issue, comment: IssueComment, fields: GqlField[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const field of flattenFields(fields, 'IssueComment')) {
-    switch (field.name) {
-      case 'id': out[field.alias] = commentGid(repo, issue, comment); break;
-      case 'body': out[field.alias] = comment.body; break;
-      case 'createdAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case '__typename': out[field.alias] = 'IssueComment'; break;
-      default: break;
-    }
-  }
-  return out;
+  return gqlOut(fields, 'IssueComment', {
+    id: () => commentGid(repo, issue, comment),
+    body: () => comment.body,
+    createdAt: () => TS,
+  });
 }
 
 function gqlPull(repo: Repo, pull: Pull, fields: GqlField[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const field of flattenFields(fields, 'PullRequest')) {
-    switch (field.name) {
-      case 'id': out[field.alias] = pullGid(repo, pull); break;
-      case 'number': out[field.alias] = pull.number; break;
-      case 'title': out[field.alias] = pull.title; break;
-      case 'body': out[field.alias] = pull.body; break;
-      case 'state': out[field.alias] = pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED'; break;
-      case 'merged': out[field.alias] = pull.merged; break;
-      case 'headRefName': out[field.alias] = pull.headRef; break;
-      case 'baseRefName': out[field.alias] = pull.baseRef; break;
-      case 'mergeable': {
-        if (pull.state !== 'open') { out[field.alias] = 'UNKNOWN'; break; }
-        const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-        const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-        if (!headTip || !baseTip) { out[field.alias] = 'UNKNOWN'; break; }
-        out[field.alias] = threeWayMerge(repo, baseTip, headTip).conflict ? 'CONFLICTING' : 'MERGEABLE';
-        break;
-      }
-      case 'files': {
-        const files = diffFiles(repo, pull.mergeBaseSha || pull.baseSha, pull.headSha);
-        const first = typeof field.args.first === 'number' ? field.args.first : files.length;
-        const nodes = files.slice(0, first).map((file) => {
-          const node: Record<string, unknown> = {};
-          for (const child of connectionNodes(field.children)) {
-            if (child.name === 'path' || child.name === 'filename') node[child.alias] = file.filename;
-            else if (child.name === 'additions') node[child.alias] = file.additions;
-            else if (child.name === 'deletions') node[child.alias] = file.deletions;
-            else if (child.name === 'changes') node[child.alias] = file.changes;
-            else if (child.name === 'status') node[child.alias] = file.status;
-          }
-          return node;
-        });
-        out[field.alias] = { nodes, pageInfo: { hasNextPage: files.length > first, endCursor: null } };
-        break;
-      }
-      case 'createdAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case 'mergedAt': out[field.alias] = pull.merged ? pull.mergedAt : null; break;
-      case 'url': out[field.alias] = `https://github.example/${VIEWER_LOGIN}/${repo.name}/pull/${pull.number}`; break;
-      case '__typename': out[field.alias] = 'PullRequest'; break;
-      default: break;
-    }
+  return gqlOut(fields, 'PullRequest', {
+    id: () => pullGid(repo, pull),
+    number: () => pull.number,
+    title: () => pull.title,
+    body: () => pull.body,
+    state: () => (pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED'),
+    merged: () => pull.merged,
+    headRefName: () => pull.headRef,
+    baseRefName: () => pull.baseRef,
+    mergeable: () => {
+      if (pull.state !== 'open') return 'UNKNOWN';
+      const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+      const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+      if (!headTip || !baseTip) return 'UNKNOWN';
+      return threeWayMerge(repo, baseTip, headTip).conflict ? 'CONFLICTING' : 'MERGEABLE';
+    },
+    files: (field) => {
+      const files = diffFiles(repo, pull.mergeBaseSha || pull.baseSha, pull.headSha);
+      const first = typeof field.args.first === 'number' ? field.args.first : files.length;
+      const nodes = files.slice(0, first).map((file) => {
+        const node: Record<string, unknown> = {};
+        for (const child of connectionNodes(field.children)) {
+          if (child.name === 'path' || child.name === 'filename') node[child.alias] = file.filename;
+          else if (child.name === 'additions') node[child.alias] = file.additions;
+          else if (child.name === 'deletions') node[child.alias] = file.deletions;
+          else if (child.name === 'changes') node[child.alias] = file.changes;
+          else if (child.name === 'status') node[child.alias] = file.status;
+        }
+        return node;
+      });
+      return { nodes, pageInfo: { hasNextPage: files.length > first, endCursor: null } };
+    },
+    createdAt: () => TS,
+    mergedAt: () => (pull.merged ? pull.mergedAt : null),
+    url: () => `https://github.example/${VIEWER_LOGIN}/${repo.name}/pull/${pull.number}`,
+  });
+}
+
+/** A GraphQL connection page over items with a numeric cursor (`number`). */
+function gqlConn<T extends { number: number }>(items: readonly T[], first: number, after: number | undefined, map: (item: T) => unknown): Record<string, unknown> {
+  let list = [...items];
+  if (after !== undefined) {
+    const index = list.findIndex((item) => item.number === after);
+    if (index >= 0) list = list.slice(index + 1);
   }
-  return out;
+  const page = list.slice(0, first);
+  return {
+    nodes: page.map(map),
+    totalCount: list.length,
+    pageInfo: {
+      hasNextPage: list.length > first,
+      hasPreviousPage: false,
+      endCursor: page.length > 0 ? cursorOf(page[page.length - 1]!.number) : null,
+      startCursor: page.length > 0 ? cursorOf(page[0]!.number) : null,
+    },
+  };
 }
 
 function gqlRepo(repo: Repo, fields: GqlField[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const field of flattenFields(fields, 'Repository')) {
-    switch (field.name) {
-      case 'id': out[field.alias] = repoGid(repo); break;
-      case 'databaseId': out[field.alias] = repo.id; break;
-      case 'name': out[field.alias] = repo.name; break;
-      case 'nameWithOwner': out[field.alias] = `${VIEWER_LOGIN}/${repo.name}`; break;
-      case 'owner': out[field.alias] = gqlUser(field.children); break;
-      case 'defaultBranchRef': out[field.alias] = { name: repo.defaultBranch }; break;
-      case 'viewerPermission': out[field.alias] = 'ADMIN'; break;
-      case 'hasIssuesEnabled': out[field.alias] = true; break;
-      case 'description': out[field.alias] = repo.description; break;
-      case 'private': out[field.alias] = repo.isPrivate; break;
-      case 'createdAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case 'updatedAt': out[field.alias] = '2023-11-14T22:13:20Z'; break;
-      case 'url': out[field.alias] = `https://github.example/${VIEWER_LOGIN}/${repo.name}`; break;
-      case 'issue': {
-        const number = field.args.number;
-        const issue = typeof number === 'number' ? repo.issues.get(number) : undefined;
-        out[field.alias] = issue ? gqlIssue(repo, issue, field.children) : null;
-        break;
+  return gqlOut(fields, 'Repository', {
+    id: () => repoGid(repo),
+    databaseId: () => repo.id,
+    name: () => repo.name,
+    nameWithOwner: () => `${VIEWER_LOGIN}/${repo.name}`,
+    owner: (field) => gqlUser(field.children),
+    defaultBranchRef: () => ({ name: repo.defaultBranch }),
+    viewerPermission: () => 'ADMIN',
+    hasIssuesEnabled: () => true,
+    description: () => repo.description,
+    private: () => repo.isPrivate,
+    createdAt: () => TS,
+    updatedAt: () => TS,
+    url: () => `https://github.example/${VIEWER_LOGIN}/${repo.name}`,
+    issue: (field) => {
+      const number = field.args.number;
+      const issue = typeof number === 'number' ? repo.issues.get(number) : undefined;
+      return issue ? gqlIssue(repo, issue, field.children) : null;
+    },
+    issues: (field) => {
+      const states = Array.isArray(field.args.states) ? field.args.states.map(String) : [];
+      const orderBy = asRecord(field.args.orderBy);
+      const first = typeof field.args.first === 'number' ? field.args.first : 100;
+      const after = typeof field.args.after === 'string' ? cursorNumber(field.args.after) : undefined;
+      let list = [...repo.issues.values()];
+      if (states.length > 0) {
+        list = list.filter((issue) => states.includes(issue.state === 'open' ? 'OPEN' : 'CLOSED'));
       }
-      case 'issues': {
-        const states = Array.isArray(field.args.states) ? field.args.states.map(String) : [];
-        const orderBy = asRecord(field.args.orderBy);
-        const first = typeof field.args.first === 'number' ? field.args.first : 100;
-        const after = typeof field.args.after === 'string' ? cursorNumber(field.args.after) : undefined;
-        let list = [...repo.issues.values()];
-        if (states.length > 0) {
-          list = list.filter((issue) => states.includes(issue.state === 'open' ? 'OPEN' : 'CLOSED'));
-        }
-        const direction = orderBy.direction === 'DESC' ? -1 : 1;
-        if (orderBy.field === 'CREATED_AT') {
-          list.sort((a, b) => (a.createdSeq - b.createdSeq) * direction || (a.number - b.number) * direction);
-        } else {
-          list.sort((a, b) => (a.number - b.number) * direction);
-        }
-        if (after !== undefined) {
-          const index = list.findIndex((issue) => issue.number === after);
-          if (index >= 0) list = list.slice(index + 1);
-        }
-        const page = list.slice(0, first);
-        const nodes = page.map((issue) => gqlIssue(repo, issue, connectionNodes(field.children)));
-        out[field.alias] = {
-          nodes,
-          totalCount: list.length,
-          pageInfo: {
-            hasNextPage: list.length > first,
-            hasPreviousPage: false,
-            endCursor: page.length > 0 ? cursorOf(page[page.length - 1]!.number) : null,
-            startCursor: page.length > 0 ? cursorOf(page[0]!.number) : null,
-          },
-        };
-        break;
+      const direction = orderBy.direction === 'DESC' ? -1 : 1;
+      if (orderBy.field === 'CREATED_AT') {
+        list.sort((a, b) => (a.createdSeq - b.createdSeq) * direction || (a.number - b.number) * direction);
+      } else {
+        list.sort((a, b) => (a.number - b.number) * direction);
       }
-      case 'pullRequests': {
-        const first = typeof field.args.first === 'number' ? field.args.first : 100;
-        const after = typeof field.args.after === 'string' ? cursorNumber(field.args.after) : undefined;
-        let list = [...repo.pulls.values()].sort((a, b) => a.number - b.number);
-        if (after !== undefined) {
-          const index = list.findIndex((pull) => pull.number === after);
-          if (index >= 0) list = list.slice(index + 1);
-        }
-        const page = list.slice(0, first);
-        out[field.alias] = {
-          nodes: page.map((pull) => gqlPull(repo, pull, connectionNodes(field.children))),
-          totalCount: list.length,
-          pageInfo: {
-            hasNextPage: list.length > first,
-            hasPreviousPage: false,
-            endCursor: page.length > 0 ? cursorOf(page[page.length - 1]!.number) : null,
-            startCursor: page.length > 0 ? cursorOf(page[0]!.number) : null,
-          },
-        };
-        break;
-      }
-      case 'pullRequest': {
-        const number = field.args.number;
-        const pull = typeof number === 'number' ? repo.pulls.get(number) : undefined;
-        out[field.alias] = pull ? gqlPull(repo, pull, field.children) : null;
-        break;
-      }
-      case '__typename': out[field.alias] = 'Repository'; break;
-      default: break;
-    }
-  }
-  return out;
+      return gqlConn(list, first, after, (issue) => gqlIssue(repo, issue, connectionNodes(field.children)));
+    },
+    pullRequests: (field) => {
+      const first = typeof field.args.first === 'number' ? field.args.first : 100;
+      const after = typeof field.args.after === 'string' ? cursorNumber(field.args.after) : undefined;
+      const list = [...repo.pulls.values()].sort((a, b) => a.number - b.number);
+      return gqlConn(list, first, after, (pull) => gqlPull(repo, pull, connectionNodes(field.children)));
+    },
+    pullRequest: (field) => {
+      const number = field.args.number;
+      const pull = typeof number === 'number' ? repo.pulls.get(number) : undefined;
+      return pull ? gqlPull(repo, pull, field.children) : null;
+    },
+  });
 }
 
 function connectionNodes(children: GqlField[]): GqlField[] {
@@ -2308,65 +2260,45 @@ function connectionNodes(children: GqlField[]): GqlField[] {
 }
 
 function gqlUser(fields: GqlField[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const field of flattenFields(fields, 'User')) {
-    switch (field.name) {
-      case 'login': out[field.alias] = VIEWER_LOGIN; break;
-      case 'id': out[field.alias] = gid('User', VIEWER_LOGIN); break;
-      case 'name': out[field.alias] = VIEWER_NAME; break;
-      case 'email': out[field.alias] = VIEWER_EMAIL; break;
-      case 'url': out[field.alias] = `https://github.example/${VIEWER_LOGIN}`; break;
-      case '__typename': out[field.alias] = 'User'; break;
-      default: break;
+  return gqlOut(fields, 'User', {
+    login: () => VIEWER_LOGIN,
+    id: () => gid('User', VIEWER_LOGIN),
+    name: () => VIEWER_NAME,
+    email: () => VIEWER_EMAIL,
+    url: () => `https://github.example/${VIEWER_LOGIN}`,
+  });
+}
+
+/** Introspection `name`/`description` nodes for a list of names. */
+function nameNodes(children: GqlField[], names: readonly string[]): Record<string, unknown>[] {
+  return names.map((valueName) => {
+    const node: Record<string, unknown> = {};
+    for (const child of children) {
+      if (child.name === 'name') node[child.alias] = valueName;
+      else if (child.name === 'description') node[child.alias] = null;
     }
-  }
-  return out;
+    return node;
+  });
 }
 
 function gqlTypeInfo(name: string, fields: GqlField[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  fields = flattenFields(fields, '__Type');
   const fieldSet = SCHEMA_FIELDS[name];
   const enumValues = name === 'SearchType' ? SEARCH_TYPE_VALUES : name === 'IssueState' ? ISSUE_STATE_VALUES : name === 'PullRequestState' ? PR_STATE_VALUES : undefined;
-  for (const field of fields) {
-    switch (field.name) {
-      case 'name': out[field.alias] = name; break;
-      case 'kind': out[field.alias] = enumValues ? 'ENUM' : 'OBJECT'; break;
-      case 'description': out[field.alias] = null; break;
-      case 'fields': {
-        const includeDeprecated = field.args.includeDeprecated === true;
-        void includeDeprecated;
-        const names = fieldSet ? [...fieldSet].sort() : [];
-        out[field.alias] = names.map((fieldName) => {
-          const node: Record<string, unknown> = {};
-          for (const child of field.children) {
-            if (child.name === 'name') node[child.alias] = fieldName;
-            else if (child.name === 'description') node[child.alias] = null;
-          }
-          return node;
-        });
-        break;
-      }
-      case 'enumValues': {
-        const includeDeprecated = field.args.includeDeprecated === true;
-        void includeDeprecated;
-        const values = enumValues ?? [];
-        out[field.alias] = values.map((valueName) => {
-          const node: Record<string, unknown> = {};
-          for (const child of field.children) {
-            if (child.name === 'name') node[child.alias] = valueName;
-            else if (child.name === 'description') node[child.alias] = null;
-          }
-          return node;
-        });
-        break;
-      }
-      case '__typename': out[field.alias] = '__Type'; break;
-      default: break;
-    }
-  }
-  return out;
+  return gqlOut(fields, '__Type', {
+    name: () => name,
+    kind: () => (enumValues ? 'ENUM' : 'OBJECT'),
+    description: () => null,
+    fields: (field) => nameNodes(field.children, fieldSet ? [...fieldSet].sort() : []),
+    enumValues: (field) => nameNodes(field.children, enumValues ?? []),
+  });
 }
+
+/** Child object type each field's selection set is validated against. */
+const GQL_CHILD_TYPE: Record<string, string> = {
+  repository: 'Repository', issue: 'Issue', pullRequest: 'PullRequest', node: 'Repository',
+  viewer: 'User', owner: 'User', defaultBranchRef: 'BranchRef', __type: '__Type',
+};
+const GQL_CHILD_CONNECTION: Record<string, string> = { issues: 'Issue', pullRequests: 'PullRequest', files: 'PullRequestChangedFile' };
 
 /** Validate the operation's fields against the schema surface; collect "Cannot query field" errors. */
 function validateFields(fields: GqlField[], typeName: string, errors: { message: string }[]): void {
@@ -2384,26 +2316,49 @@ function validateFields(fields: GqlField[], typeName: string, errors: { message:
       errors.push({ message: `Cannot query field "${field.name}" on type "${typeName}".` });
       continue;
     }
-    if (field.name === 'repository' || field.name === 'issue' || field.name === 'pullRequest' || field.name === 'node') {
-      validateFields(field.children, field.name === 'repository' ? 'Repository' : field.name === 'issue' ? 'Issue' : field.name === 'pullRequest' ? 'PullRequest' : 'Repository', errors);
-    } else if (field.name === 'issues') {
-      validateFields(connectionNodes(field.children), 'Issue', errors);
-    } else if (field.name === 'pullRequests') {
-      validateFields(connectionNodes(field.children), 'PullRequest', errors);
-    } else if (field.name === 'viewer' || field.name === 'owner') {
-      validateFields(field.children, 'User', errors);
-    } else if (field.name === 'defaultBranchRef') {
-      validateFields(field.children, 'BranchRef', errors);
-    } else if (field.name === 'files') {
-      validateFields(connectionNodes(field.children), 'PullRequestChangedFile', errors);
-    } else if (field.name === '__type') {
-      validateFields(field.children, '__Type', errors);
+    const childType = GQL_CHILD_TYPE[field.name];
+    if (childType) validateFields(field.children, childType, errors);
+    else {
+      const connType = GQL_CHILD_CONNECTION[field.name];
+      if (connType) validateFields(connectionNodes(field.children), connType, errors);
     }
   }
 }
 
-const BRANCH_REF_FIELDS = new Set(['name', 'prefix', 'target']);
-SCHEMA_FIELDS.BranchRef = BRANCH_REF_FIELDS;
+/** Query root fields, by name. Mutations never reach these (see executeOperation). */
+const QUERY_HANDLERS: Record<string, (field: GqlField) => unknown> = {
+  viewer: (field) => gqlUser(field.children),
+  repository: (field) => {
+    const owner = field.args.owner;
+    const name = field.args.name;
+    const repo = typeof owner === 'string' && typeof name === 'string' ? getRepo(owner, name) : undefined;
+    return repo ? gqlRepo(repo, field.children) : null;
+  },
+  node: (field) => {
+    const id = typeof field.args.id === 'string' ? field.args.id : undefined;
+    const decoded = id ? ungid(id) : undefined;
+    if (decoded?.kind === 'Repository') {
+      const repo = findRepo(parseInt(decoded.payload, 10));
+      return repo ? gqlRepo(repo, field.children) : null;
+    }
+    if (decoded?.kind === 'Issue') {
+      const found = gidIssue(id);
+      return found ? gqlIssue(found.repo, found.issue, field.children) : null;
+    }
+    if (decoded?.kind === 'PullRequest') {
+      const found = gidPull(id);
+      return found ? gqlPull(found.repo, found.pull, field.children) : null;
+    }
+    return null;
+  },
+  __type: (field) => {
+    const name = typeof field.args.name === 'string' ? field.args.name : '';
+    return SCHEMA_FIELDS[name] || name === 'SearchType' || name === 'IssueState' || name === 'PullRequestState'
+      ? gqlTypeInfo(name, field.children)
+      : null;
+  },
+  __schema: () => ({ queryType: { name: 'Query' }, mutationType: { name: 'Mutation' } }),
+};
 
 function executeOperation(operation: GqlOperation, errors: { message: string }[]): Record<string, unknown> | null {
   const rootType = operation.kind === 'mutation' ? 'Mutation' : 'Query';
@@ -2412,49 +2367,11 @@ function executeOperation(operation: GqlOperation, errors: { message: string }[]
   const data: Record<string, unknown> = {};
   for (const field of operation.fields) {
     if (field.name === '__typename') { data[field.alias] = rootType; continue; }
-    if (field.name === 'viewer') { data[field.alias] = gqlUser(field.children); continue; }
-    if (field.name === 'repository') {
-      const owner = field.args.owner;
-      const name = field.args.name;
-      const repo = typeof owner === 'string' && typeof name === 'string' ? getRepo(owner, name) : undefined;
-      data[field.alias] = repo ? gqlRepo(repo, field.children) : null;
-      continue;
-    }
-    if (field.name === 'node') {
-      const id = typeof field.args.id === 'string' ? ungid(field.args.id) : undefined;
-      let node: Record<string, unknown> | null = null;
-      if (id) {
-        if (id.kind === 'Repository') {
-          const repo = [...store.repos.values()].find((candidate) => candidate.id === parseInt(id.payload, 10));
-          if (repo) node = gqlRepo(repo, field.children);
-        } else if (id.kind === 'Issue') {
-          const [repoId, number] = id.payload.split(':').map(Number);
-          const repo = [...store.repos.values()].find((candidate) => candidate.id === repoId);
-          const issue = repo?.issues.get(number!);
-          if (repo && issue) node = gqlIssue(repo, issue, field.children);
-        } else if (id.kind === 'PullRequest') {
-          const [repoId, number] = id.payload.split(':').map(Number);
-          const repo = [...store.repos.values()].find((candidate) => candidate.id === repoId);
-          const pull = repo?.pulls.get(number!);
-          if (repo && pull) node = gqlPull(repo, pull, field.children);
-        }
-      }
-      data[field.alias] = node;
-      continue;
-    }
-    if (field.name === '__type') {
-      const name = typeof field.args.name === 'string' ? field.args.name : '';
-      data[field.alias] = SCHEMA_FIELDS[name] || name === 'SearchType' || name === 'IssueState' || name === 'PullRequestState'
-        ? gqlTypeInfo(name, field.children)
-        : null;
-      continue;
-    }
-    if (field.name === '__schema') { data[field.alias] = { queryType: { name: 'Query' }, mutationType: { name: 'Mutation' } }; continue; }
-    if (operation.kind === 'mutation') {
-      data[field.alias] = executeMutation(field, errors);
-      continue;
-    }
-    data[field.alias] = null;
+    // Validation already rejected any field outside the operation's own type,
+    // so a mutation field can go straight to the mutation executor.
+    if (operation.kind === 'mutation') { data[field.alias] = executeMutation(field, errors); continue; }
+    const handler = QUERY_HANDLERS[field.name];
+    data[field.alias] = handler ? handler(field) : null;
   }
   return data;
 }
@@ -2475,10 +2392,7 @@ function executeMutation(field: GqlField, errors: { message: string }[]): Record
     return out;
   };
   if (field.name === 'createIssue') {
-    const repositoryId = typeof input.repositoryId === 'string' ? ungid(input.repositoryId) : undefined;
-    const repo = repositoryId?.kind === 'Repository'
-      ? [...store.repos.values()].find((candidate) => candidate.id === parseInt(repositoryId.payload, 10))
-      : undefined;
+    const repo = gidRepo(input.repositoryId);
     if (!repo) { errors.push({ message: 'Could not resolve to a Repository with the global id provided.' }); return null; }
     const title = typeof input.title === 'string' ? input.title : '';
     const body = typeof input.body === 'string' ? input.body : '';
@@ -2488,21 +2402,15 @@ function executeMutation(field: GqlField, errors: { message: string }[]): Record
     return pick(field.children, { issue: { number: issue.number, id: issueGid(repo, issue), __typename: 'Issue' }, __typename: 'CreateIssuePayload' });
   }
   if (field.name === 'closeIssue') {
-    const issueId = typeof input.issueId === 'string' ? ungid(input.issueId) : undefined;
-    if (issueId?.kind !== 'Issue') { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
-    const [repoId, number] = issueId.payload.split(':').map(Number);
-    const repo = [...store.repos.values()].find((candidate) => candidate.id === repoId);
-    const issue = repo?.issues.get(number!);
-    if (!repo || !issue) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
+    const found = gidIssue(input.issueId);
+    if (!found) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
+    const { repo, issue } = found;
     issue.state = 'closed';
     issue.updatedSeq = nextSeq();
     return pick(field.children, { issue: { number: issue.number, id: issueGid(repo, issue), state: 'CLOSED', __typename: 'Issue' }, __typename: 'CloseIssuePayload' });
   }
   if (field.name === 'createPullRequest') {
-    const repositoryId = typeof input.repositoryId === 'string' ? ungid(input.repositoryId) : undefined;
-    const repo = repositoryId?.kind === 'Repository'
-      ? [...store.repos.values()].find((candidate) => candidate.id === parseInt(repositoryId.payload, 10))
-      : undefined;
+    const repo = gidRepo(input.repositoryId);
     if (!repo) { errors.push({ message: 'Could not resolve to a Repository with the global id provided.' }); return null; }
     const created = createPullInternal(
       repo,
@@ -2522,12 +2430,9 @@ function executeMutation(field: GqlField, errors: { message: string }[]): Record
     });
   }
   if (field.name === 'mergePullRequest') {
-    const pullId = typeof input.pullRequestId === 'string' ? ungid(input.pullRequestId) : undefined;
-    if (pullId?.kind !== 'PullRequest') { errors.push({ message: 'Could not resolve to a PullRequest with the global id provided.' }); return null; }
-    const [repoId, number] = pullId.payload.split(':').map(Number);
-    const repo = [...store.repos.values()].find((candidate) => candidate.id === repoId);
-    const pull = repo?.pulls.get(number!);
-    if (!repo || !pull) { errors.push({ message: 'Could not resolve to a PullRequest with the global id provided.' }); return null; }
+    const found = gidPull(input.pullRequestId);
+    if (!found) { errors.push({ message: 'Could not resolve to a PullRequest with the global id provided.' }); return null; }
+    const { repo, pull } = found;
     const merged = mergePullInternal(repo, pull, 'squash');
     if (merged.error) { errors.push({ message: merged.error }); return null; }
     return pick(field.children, {
@@ -2538,15 +2443,12 @@ function executeMutation(field: GqlField, errors: { message: string }[]): Record
     });
   }
   if (field.name === 'addComment') {
-    const subjectId = typeof input.subjectId === 'string' ? ungid(input.subjectId) : undefined;
-    if (subjectId?.kind !== 'Issue') { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
-    const [repoId, number] = subjectId.payload.split(':').map(Number);
-    const repo = [...store.repos.values()].find((candidate) => candidate.id === repoId);
-    const issue = repo?.issues.get(number!);
-    if (!repo || !issue) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
+    const found = gidIssue(input.subjectId);
+    if (!found) { errors.push({ message: 'Could not resolve to an Issue with the global id provided.' }); return null; }
+    const { repo, issue } = found;
     const body = typeof input.body === 'string' ? input.body : '';
     const comment: IssueComment = { id: repo.nextComment++, body, createdSeq: nextSeq() };
-    (repo.comments.get(number) ?? []).push(comment);
+    (repo.comments.get(issue.number) ?? []).push(comment);
     const node = { id: commentGid(repo, issue, comment), body, __typename: 'IssueComment' };
     return pick(field.children, { commentEdge: { node, __typename: 'IssueCommentEdge' }, __typename: 'AddCommentPayload' });
   }
@@ -2590,88 +2492,24 @@ interface McpToolDef {
   inputSchema: { type: 'object'; properties: Record<string, { type: string; description?: string }>; required: string[] };
 }
 
+/** Build one tool definition; key order matches the canonical tools/list shape. */
+const tool = (name: string, description: string, props: readonly [string, string, string][], required: string[]): McpToolDef => ({
+  name,
+  description,
+  inputSchema: {
+    type: 'object',
+    properties: Object.fromEntries(props.map(([key, type, desc]) => [key, { type, description: desc }])),
+    required,
+  },
+});
+
 const MCP_TOOLS: McpToolDef[] = [
-  {
-    name: 'create_repo',
-    description: 'Create a new repository owned by the authenticated user.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: 'The name of the repository.' },
-        description: { type: 'string', description: 'A short description of the repository.' },
-        private: { type: 'boolean', description: 'Whether the repository is private.' },
-      },
-      required: ['name'],
-    },
-  },
-  {
-    name: 'get_repo',
-    description: 'Get a repository by owner and name.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-      },
-      required: ['owner', 'repo'],
-    },
-  },
-  {
-    name: 'create_issue',
-    description: 'Create an issue in a repository.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        title: { type: 'string', description: 'The issue title.' },
-        body: { type: 'string', description: 'The issue body.' },
-      },
-      required: ['owner', 'repo', 'title'],
-    },
-  },
-  {
-    name: 'list_issues',
-    description: 'List issues in a repository.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        state: { type: 'string', description: 'Issue state filter: open, closed, or all.' },
-      },
-      required: ['owner', 'repo'],
-    },
-  },
-  {
-    name: 'create_pull_request',
-    description: 'Create a pull request between two branches.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        title: { type: 'string', description: 'The pull request title.' },
-        body: { type: 'string', description: 'The pull request body.' },
-        head: { type: 'string', description: 'The head branch name.' },
-        base: { type: 'string', description: 'The base branch name.' },
-      },
-      required: ['owner', 'repo', 'title', 'head', 'base'],
-    },
-  },
-  {
-    name: 'merge_pull_request',
-    description: 'Merge a pull request.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        pull_number: { type: 'integer', description: 'The pull request number.' },
-      },
-      required: ['owner', 'repo', 'pull_number'],
-    },
-  },
+  tool('create_repo', 'Create a new repository owned by the authenticated user.', [['name', 'string', 'The name of the repository.'], ['description', 'string', 'A short description of the repository.'], ['private', 'boolean', 'Whether the repository is private.']], ['name']),
+  tool('get_repo', 'Get a repository by owner and name.', [['owner', 'string', 'The repository owner login.'], ['repo', 'string', 'The repository name.']], ['owner', 'repo']),
+  tool('create_issue', 'Create an issue in a repository.', [['owner', 'string', 'The repository owner login.'], ['repo', 'string', 'The repository name.'], ['title', 'string', 'The issue title.'], ['body', 'string', 'The issue body.']], ['owner', 'repo', 'title']),
+  tool('list_issues', 'List issues in a repository.', [['owner', 'string', 'The repository owner login.'], ['repo', 'string', 'The repository name.'], ['state', 'string', 'Issue state filter: open, closed, or all.']], ['owner', 'repo']),
+  tool('create_pull_request', 'Create a pull request between two branches.', [['owner', 'string', 'The repository owner login.'], ['repo', 'string', 'The repository name.'], ['title', 'string', 'The pull request title.'], ['body', 'string', 'The pull request body.'], ['head', 'string', 'The head branch name.'], ['base', 'string', 'The base branch name.']], ['owner', 'repo', 'title', 'head', 'base']),
+  tool('merge_pull_request', 'Merge a pull request.', [['owner', 'string', 'The repository owner login.'], ['repo', 'string', 'The repository name.'], ['pull_number', 'integer', 'The pull request number.']], ['owner', 'repo', 'pull_number']),
 ];
 
 const MCP_SERVER_INFO = { name: 'forge', version: '1.0.0' };
@@ -2734,8 +2572,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): { ok: true; v
 
 function handleMcp(ctx: ReqCtx): void {
   if (ctx.method === 'DELETE') {
-    ctx.res.writeHead(204, { 'x-github-request-id': ctx.requestId });
-    ctx.res.end();
+    sendEmpty(ctx, 204);
     return;
   }
   if (ctx.method !== 'POST') { sendError(ctx, 404, 'Not Found'); return; }
@@ -2754,8 +2591,7 @@ function handleMcp(ctx: ReqCtx): void {
   }
   if (!('id' in record)) {
     // A notification: acknowledge and stop (202, empty body).
-    ctx.res.writeHead(202, { 'x-github-request-id': ctx.requestId });
-    ctx.res.end();
+    sendEmpty(ctx, 202);
     return;
   }
   const method = typeof record.method === 'string' ? record.method : '';
@@ -2779,8 +2615,7 @@ function handleMcp(ctx: ReqCtx): void {
     return;
   }
   if (method === 'notifications/initialized' || method.startsWith('notifications/')) {
-    ctx.res.writeHead(202, { 'x-github-request-id': ctx.requestId });
-    ctx.res.end();
+    sendEmpty(ctx, 202);
     return;
   }
   if (method === 'ping') { mcpResult(ctx, id, {}); return; }
@@ -2850,7 +2685,6 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
         if (text === 'peel') args.peel = true;
         else if (text === 'symrefs') args.symrefs = true;
         else if (text === 'unborn') args.unborn = true;
-        else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
         else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
       }
       sendBytes(ctx, 200, handleLsRefs(repo, args), 'application/x-git-upload-pack-result');
