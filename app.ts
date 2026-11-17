@@ -1198,12 +1198,14 @@ function fetchSelection(
   }).sort();
   // Unshallow: a previous shallow boundary whose parents are all present now
   // (sent or held) is no longer a boundary. A plain fetch that sends nothing
-  // new unshallows nothing.
+  // new unshallows nothing. A ROOT boundary has no parents, so its (empty)
+  // parent set is vacuously satisfied: oracle-verified vs git 2.43, a
+  // `fetch --unshallow` after deepen-to-the-root removes the shallow file.
   const unshallow: string[] = args.shallow.filter((oid) => {
     const object = lookup(oid);
     if (object?.type !== 'commit') return false;
     const parents = parseCommit(object.data).parents;
-    return parents.length > 0 && parents.every((p) => sentIds.has(p) || held.has(p));
+    return parents.every((p) => sentIds.has(p) || held.has(p));
   });
   return { send: objects, shallow, unshallow };
 }
