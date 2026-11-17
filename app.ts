@@ -462,6 +462,8 @@ type Label = { name: string; color: string };
 type Issue = {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: string[]; createdSeq: number; updatedSeq: number;
+  /** Cached single-GET body; valid while the fingerprint in issueJsonBytes matches. */
+  jsonCache?: { seq: number; comments: number; labelColors: string; body: Buffer };
 };
 type IssueComment = { id: number; body: string; createdSeq: number };
 type Pull = {
@@ -765,6 +767,25 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     state_reason: issue.state === 'closed' ? 'completed' : null,
     author_association: 'OWNER',
   };
+}
+
+/**
+ * Serialized single-issue GET body, cached while nothing it shows can change.
+ * The fingerprint covers every input issueJson reads that can move: updatedSeq
+ * (bumped by every REST PATCH and GraphQL closeIssue, so title/body/state/
+ * labels), the comment count (comment posts do not bump updatedSeq), and the
+ * labels' colours (a label re-POST overwrites its colour without touching the
+ * issue). Repo name/id never change; all other fields are constants. A
+ * fingerprint miss rebuilds the bytes, so a stale cache is impossible.
+ */
+function issueJsonBytes(repo: Repo, issue: Issue): Buffer {
+  const count = (repo.comments.get(issue.number) ?? []).length;
+  const labelColors = issue.labels.map((name) => repo.labels.get(name)?.color ?? '000000').join(',');
+  const cached = issue.jsonCache;
+  if (cached && cached.seq === issue.updatedSeq && cached.comments === count && cached.labelColors === labelColors) return cached.body;
+  const body = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issue.jsonCache = { seq: issue.updatedSeq, comments: count, labelColors, body };
+  return body;
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: IssueComment): Record<string, unknown> {
@@ -1658,7 +1679,7 @@ function handleIssues(ctx: ReqCtx, repo: Repo, owner: string, name: string, tail
   const issue = repo.issues.get(number);
   if (!issue) { sendError(ctx, 404, 'Not Found'); return; }
   if (tail.length === 1) {
-    if (ctx.method === 'GET') { sendJson(ctx, 200, issueJson(repo, issue)); return; }
+    if (ctx.method === 'GET') { sendBytes(ctx, 200, issueJsonBytes(repo, issue), JSON_TYPE); return; }
     if (ctx.method === 'PATCH') {
       const body = jsonBody(ctx);
       if (!body) return;
@@ -2728,6 +2749,9 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
 
 export function createApp(): Server {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // No Date header: the suite never reads one, and skipping it saves a
+    // per-response date format plus ~30 header bytes on every reply.
+    res.sendDate = false;
     requestCounter += 1;
     const requestId = `req-${requestCounter.toString(16).padStart(8, '0')}`;
     try {
