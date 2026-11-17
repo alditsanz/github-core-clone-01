@@ -479,6 +479,9 @@ type Pull = {
   merged: boolean; mergedAt: string; mergeCommitSha: string; mergeBaseSha: string;
   createdSeq: number; updatedSeq: number;
 };
+/** One memoized fetch answer: the pack bytes plus its shallow/unshallow lines. */
+interface CachedFetch { pack: Buffer; shallow: string[]; unshallow: string[] }
+
 type Repo = {
   id: number; name: string; description: string; isPrivate: boolean;
   objects: Map<string, GitObject>;
@@ -490,6 +493,14 @@ type Repo = {
   pulls: Map<number, Pull>;
   nextIssue: number; nextPull: number; nextComment: number;
   createdSeq: number; updatedSeq: number;
+  /**
+   * Git-state version: bumped on every object insert and every ref set/delete,
+   * so the fetch-pack cache key below can never match a changed repo. REST
+   * state (issues/pulls/labels) never affects a pack and does not bump it.
+   */
+  version: number;
+  /** Memoized fetch packs, keyed by version + fetch args (capped, FIFO). */
+  fetchCache: Map<string, CachedFetch>;
 };
 
 interface Store { repos: Map<string, Repo>; nextRepoId: number; seq: number }
@@ -531,6 +542,8 @@ function createRepo(name: string, description = '', isPrivate = false): Repo {
     nextComment: 1,
     createdSeq: seq,
     updatedSeq: seq,
+    version: 0,
+    fetchCache: new Map(),
   };
   store.repos.set(name, repo);
   return repo;
@@ -547,9 +560,15 @@ function repoLookup(repo: Repo): (oid: string) => GitObject | undefined {
   return (oid) => repo.objects.get(oid);
 }
 
+/** Bump a repo's git-state version: any object or ref change invalidates the fetch-pack cache. */
+function bumpRepoVersion(repo: Repo): void { repo.version += 1; }
+
 function storeObject(repo: Repo, type: GitObjectType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    bumpRepoVersion(repo);
+  }
   return oid;
 }
 
@@ -1067,6 +1086,7 @@ function fetchSelection(
     depthLimit = boundaryDepth + args.depth + 1;
   }
   const included = new Set<string>();
+  const includedDist = new Map<string, number>();
   const visited = new Set<string>();
   const runBfs = (roots: { oid: string; distance: number }[]): void => {
     const queue = [...roots];
@@ -1080,6 +1100,7 @@ function fetchSelection(
       const commit = parseCommit(object.data);
       if (args.deepenSince !== undefined && commit.timestamp < args.deepenSince) continue;
       included.add(oid);
+      includedDist.set(oid, distance);
       // Without a depth limit, the client's shallow boundary stops the walk:
       // the client has that commit but not its parents, and sending the
       // parents would silently un-shallow its repo (real git upload-pack
@@ -1164,10 +1185,16 @@ function fetchSelection(
   // "remote did not send all necessary objects" when it traverses the sent
   // commit's parents. A plain fetch that sends nothing reports no shallow
   // lines at all.
+  // A ROOT commit (no parents) is a boundary only when it sits exactly at the
+  // depth limit: oracle-verified vs git 2.43 — depth-1 on a 1-commit repo
+  // lists the root as shallow, but depth-2 on the same repo and depth-5 on a
+  // 3-commit repo do not (there the walk ended naturally, not at the limit).
   const shallow: string[] = [...sentIds].filter((oid) => {
     const object = lookup(oid);
     if (object?.type !== 'commit') return false;
-    return parseCommit(object.data).parents.some((p) => !sentIds.has(p) && !held.has(p));
+    const parents = parseCommit(object.data).parents;
+    if (parents.some((p) => !sentIds.has(p) && !held.has(p))) return true;
+    return parents.length === 0 && depthLimit !== undefined && includedDist.get(oid) === depthLimit - 1;
   }).sort();
   // Unshallow: a previous shallow boundary whose parents are all present now
   // (sent or held) is no longer a boundary. A plain fetch that sends nothing
@@ -1192,10 +1219,59 @@ function sidebandPackets(pack: Buffer): Buffer {
   return Buffer.concat(packets);
 }
 
+/**
+ * Memoized fetch answer: fetchSelection + writePack are a pure function of
+ * (repo objects, repo refs, fetch args), and the same fetch repeats verbatim
+ * across a clone workload (50 concurrent depth-1 clones of one tip) and
+ * across real clients re-fetching an unchanged repo. The cache key carries
+ * the repo version (bumped on every object insert and ref set/delete) plus
+ * every arg that changes the selection, so a hit is byte-identical to a fresh
+ * computation; thin-pack/ofs-delta/no-progress never change our delta-less
+ * packs and `hasDone` only changes v0 framing, so both stay out of the key.
+ * The framing (ACK section, shallow-info section, sideband) is rebuilt per
+ * request from the cached pack + lines — only the selection and the pack
+ * build are memoized. Capped at 64 entries per repo (FIFO); a version bump
+ * orphans older entries, which then age out.
+ */
+function fetchPack(repo: Repo, args: FetchArgs): CachedFetch {
+  const sorted = (xs: readonly string[]): string => [...xs].sort().join(',');
+  const key = [
+    repo.version,
+    sorted(args.wants), sorted(args.haves), sorted(args.shallow), sorted(args.deepenNot),
+    args.depth ?? '', args.deepenSince ?? '', args.deepenRelative ? 1 : 0,
+    args.includeTag ? 1 : 0, args.filter,
+  ].join('|');
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
+  const { send, shallow, unshallow } = fetchSelection(repo, args);
+  const entry: CachedFetch = { pack: writePack(send), shallow, unshallow };
+  if (repo.fetchCache.size >= 64) {
+    const oldest = repo.fetchCache.keys().next().value;
+    if (oldest !== undefined) repo.fetchCache.delete(oldest);
+  }
+  repo.fetchCache.set(key, entry);
+  return entry;
+}
+
 function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
   const lookup = repoLookup(repo);
-  const { send, shallow, unshallow } = fetchSelection(repo, args);
-  const pack = writePack(send);
+  // v0 over HTTP is TWO posts when the client asks for shallow info (real git
+  // upload-pack, verified against git 2.43): the first carries the wants plus
+  // the deepen/shallow lines (no `done`) and gets only the shallow/unshallow
+  // lines plus a flush; the second repeats the wants with `done` (plus any
+  // haves) and gets the shallow lines again, a flush, then NAK/ACK and the
+  // pack. No pack is built for the first post, so it runs the selection
+  // directly instead of populating the pack cache.
+  const hasShallowRequest = args.depth !== undefined || args.deepenSince !== undefined || args.deepenNot.length > 0 || args.deepenRelative || args.shallow.length > 0;
+  if (!version2 && !args.hasDone && hasShallowRequest) {
+    const { shallow, unshallow } = fetchSelection(repo, args);
+    const parts: Buffer[] = [];
+    for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    parts.push(Buffer.from('0000', 'ascii'));
+    return Buffer.concat(parts);
+  }
+  const { pack, shallow, unshallow } = fetchPack(repo, args);
   // Acknowledgments: ACK every have the server also has, else NAK.
   const common = args.haves.filter((oid) => repo.objects.has(oid) || repo.objects.has(peelToCommit(oid, lookup)));
   const parts: Buffer[] = [];
@@ -1222,22 +1298,11 @@ function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
     parts.push(Buffer.from('0000', 'ascii'));
     return Buffer.concat(parts);
   }
-  // v0 over HTTP is TWO posts when the client asks for shallow info (real git
-  // upload-pack, verified against git 2.43): the first carries the wants plus
-  // the deepen/shallow lines (no `done`) and gets only the shallow/unshallow
-  // lines plus a flush; the second repeats the wants with `done` (plus any
-  // haves) and gets the shallow lines again, a flush, then NAK/ACK and the
-  // pack. A plain fetch (no shallow request) is a SINGLE post with `done` and
+  // v0: a plain fetch (no shallow request) is a SINGLE post with `done` and
   // gets NAK/ACK + pack directly — a leading flush before the NAK makes the
   // client fail with "expected ACK/NAK, got a flush packet", so the shallow
-  // section is emitted only when it has lines.
-  const hasShallowRequest = args.depth !== undefined || args.deepenSince !== undefined || args.deepenNot.length > 0 || args.deepenRelative || args.shallow.length > 0;
-  if (!args.hasDone && hasShallowRequest) {
-    for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-    for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-    parts.push(Buffer.from('0000', 'ascii'));
-    return Buffer.concat(parts);
-  }
+  // section is emitted only when it has lines. (The two-post shallow case
+  // returned above, before the pack cache was consulted.)
   if (shallow.length > 0 || unshallow.length > 0) {
     for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
     for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
@@ -1280,9 +1345,11 @@ function handleReceivePack(repo: Repo, body: Buffer): ReceivePackResult {
   if (packBytes.length > 0) {
     try {
       const objects = readPack(packBytes, repoLookup(repo));
+      let added = false;
       for (const [oid, object] of objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+        if (!repo.objects.has(oid)) { repo.objects.set(oid, object); added = true; }
       }
+      if (added) bumpRepoVersion(repo);
     } catch (err) {
       unpackOk = false;
       unpackError = (err as Error).message;
@@ -1324,6 +1391,7 @@ function handleReceivePack(repo: Repo, body: Buffer): ReceivePackResult {
       } else {
         if (command.next === ZERO_OID) repo.refs.delete(command.ref);
         else repo.refs.set(command.ref, command.next);
+        bumpRepoVersion(repo);
         report.push(`ok ${command.ref}\n`);
         applied += 1;
       }
@@ -1606,6 +1674,7 @@ function handleRepoRest(ctx: ReqCtx, segments: readonly string[]): void {
       const object = repo.objects.get(sha);
       if (!object) { sendError(ctx, 422, 'Validation Failed: sha does not exist'); return; }
       repo.refs.set(ref, sha);
+      bumpRepoVersion(repo);
       sendJson(ctx, 201, { ref, node_id: gid('Ref', `${repo.id}:${ref}`), url: `/api/v3/repos/${owner}/${name}/git/refs/${ref.replace(/^refs\//, '')}`, object: { sha, type: object.type, url: `/api/v3/repos/${owner}/${name}/git/${object.type}s/${sha}` } });
       return;
     }
@@ -1752,6 +1821,7 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
       // Create the branch from the default-branch tip, then commit on it.
       const defaultTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
       if (defaultTip) repo.refs.set(`refs/heads/${branch}`, defaultTip);
+      if (defaultTip) bumpRepoVersion(repo);
       tip = defaultTip;
     }
     const map = tip ? commitTreeMap(repo, tip) : new Map<string, { oid: string; mode: string }>();
@@ -1765,6 +1835,7 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
     const parents = tip ? [tip] : [];
     const commitOid = createCommit(repo, treeOid, parents, message);
     repo.refs.set(`refs/heads/${branch}`, commitOid);
+    bumpRepoVersion(repo);
     sendJson(ctx, isCreate ? 201 : 200, {
       content: { name: path.split('/').pop() ?? path, path, sha: blobOid, size: content.length, url: `/api/v3/repos/${owner}/${name}/contents/${path}`, html_url: `https://github.example/${owner}/${name}/blob/${branch}/${path}`, git_url: `/api/v3/repos/${owner}/${name}/git/blobs/${blobOid}`, download_url: `https://github.example/${owner}/${name}/raw/${branch}/${path}`, type: 'file', encoding: 'base64' },
       commit: commitJson(repo, owner, name, commitOid, message, treeOid),
@@ -1787,6 +1858,7 @@ function handleContents(ctx: ReqCtx, repo: Repo, owner: string, name: string, ta
     const treeOid = mapToTree(repo, map);
     const commitOid = createCommit(repo, treeOid, [tip], message);
     repo.refs.set(`refs/heads/${branch}`, commitOid);
+    bumpRepoVersion(repo);
     sendJson(ctx, 200, {
       commit: commitJson(repo, owner, name, commitOid, message, treeOid),
     });
@@ -1924,6 +1996,7 @@ function mergePullInternal(repo: Repo, pull: Pull, method: string): { sha?: stri
     : `Merge pull request #${pull.number} from ${VIEWER_LOGIN}/${pull.headRef}`;
   const mergeCommit = createCommit(repo, treeOid, [baseTip], message);
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeCommit);
+  bumpRepoVersion(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = TS;
