@@ -30,7 +30,7 @@ const actorJson = (): Record<string, unknown> => ({ name: VIEWER_NAME, email: VI
 type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 interface GitObject { readonly type: GitObjectType; readonly data: Buffer }
 interface TreeEntry { readonly mode: string; readonly name: string; readonly oid: string }
-interface CommitView { readonly tree: string; readonly parents: string[]; readonly author: string; readonly committer: string; readonly message: string }
+interface CommitView { readonly tree: string; readonly parents: string[]; readonly author: string; readonly committer: string; readonly message: string; readonly timestamp: number }
 interface TagView { readonly object: string; readonly type: GitObjectType; readonly tag: string; readonly tagger: string; readonly message: string }
 
 const HEX40 = /^[0-9a-f]{40}$/;
@@ -94,6 +94,7 @@ function parseCommit(data: Buffer): CommitView {
   const parents: string[] = [];
   let author = '';
   let committer = '';
+  let timestamp = 0;
   for (const line of lines) {
     if (!line) continue;
     const space = line.indexOf(' ');
@@ -102,9 +103,15 @@ function parseCommit(data: Buffer): CommitView {
     if (key === 'tree') tree = value;
     else if (key === 'parent') parents.push(value);
     else if (key === 'author') author = value;
-    else if (key === 'committer') committer = value;
+    else if (key === 'committer') {
+      committer = value;
+      // `Name <email> <unix-ts> <tz>`: the timestamp is the second-to-last token.
+      const parts = value.trim().split(/\s+/);
+      const ts = Number(parts[parts.length - 2]);
+      if (Number.isFinite(ts)) timestamp = ts;
+    }
   }
-  return { tree, parents, author, committer, message };
+  return { tree, parents, author, committer, message, timestamp };
 }
 
 function parseTag(data: Buffer): TagView {
@@ -928,7 +935,7 @@ function v0RefLines(repo: Repo, caps: string): Buffer {
 function advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', caps: string, v2 = false): { body: Buffer; type: string } {
   if (v2) {
     return {
-      body: encodePktLines(['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow filter\n', 'object-format=sha1\n', 'flush']),
+      body: encodePktLines(['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow filter include-tag\n', 'object-format=sha1\n', 'flush']),
       type: 'application/x-git-upload-pack-advertisement',
     };
   }
@@ -937,7 +944,12 @@ function advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pac
 }
 
 function uploadPackAdvertisement(repo: Repo, wantsV2: boolean): { body: Buffer; type: string } {
-  return advertisement(repo, 'git-upload-pack', 'side-band-64k ofs-delta shallow thin-pack agent=forge/1.0', wantsV2);
+  // The v0 caps mirror real git upload-pack (git 2.43): without the deepen-*
+  // caps a client refuses `--deepen` ("Server does not support --deepen"),
+  // and without `include-tag` it never asks for tag objects. `no-done` is
+  // deliberately NOT advertised: the client still sends `done`, and omitting
+  // it keeps the v0 two-post phase split unambiguous.
+  return advertisement(repo, 'git-upload-pack', `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed symref=HEAD:refs/heads/${repo.defaultBranch} object-format=sha1 agent=forge/1.0`, wantsV2);
 }
 
 function receivePackAdvertisement(repo: Repo): { body: Buffer; type: string } {
@@ -976,12 +988,28 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
 
 interface FetchArgs {
   wants: string[]; haves: string[]; shallow: string[]; depth?: number;
+  deepenRelative: boolean; deepenSince?: number; deepenNot: string[];
+  includeTag: boolean; hasDone: boolean;
   thinPack: boolean; noProgress: boolean; ofsDelta: boolean; filter: string;
 }
 
 /**
  * Objects to send for a fetch: closure(wants) minus closure(haves), depth-limited
  * when `depth` is set, plus the shallow/unshallow reports for the shallow-info section.
+ *
+ * deepen-relative: real git's `fetch --deepen=N` sends `deepen N` plus the
+ * `deepen-relative` marker, meaning N more generations past the client's current
+ * shallow boundary (the `shallow` lines it sends) — not N from the tip. The
+ * effective limit is therefore the boundary's distance from the wants plus N.
+ * deepen-since: only commits with committer time >= the timestamp are included;
+ * the deepest included commit (whose parent is older) is the shallow boundary.
+ * deepen-not: refs whose
+ * reachable commits are withheld like extra haves.
+ * filter: partial-clone filters — `blob:none` (no blobs), `tree:0` (no trees or
+ * blobs), `blob:limit=<bytes>` (no blob over the limit), `object:type=<type>`
+ * (only that object type). Anything else is ignored (full pack, as before).
+ * A want naming a blob or tree directly (a promisor/lazy fetch of a missing
+ * object after a filtered clone) is sent as-is.
  */
 function fetchSelection(
   repo: Repo,
@@ -989,33 +1017,95 @@ function fetchSelection(
 ): { send: GitObject[]; shallow: string[]; unshallow: string[] } {
   const lookup = repoLookup(repo);
   const shallowSet = new Set(args.shallow);
-  const wantCommits = args.wants.map((oid) => peelToCommit(oid, lookup));
-  const wantTags = args.wants.filter((oid) => repo.objects.get(oid)?.type === 'tag');
-  const included = new Set<string>();
-  const boundary = new Set<string>();
-  const visited = new Set<string>();
-  const queue: { oid: string; distance: number }[] = wantCommits.map((oid) => ({ oid, distance: 0 }));
-  while (queue.length > 0) {
-    const { oid, distance } = queue.shift()!;
-    if (visited.has(oid)) continue;
-    visited.add(oid);
-    const object = lookup(oid);
-    if (!object || object.type !== 'commit') continue;
-    if (args.depth !== undefined && distance >= args.depth) continue;
-    included.add(oid);
-    const commit = parseCommit(object.data);
-    for (const parent of commit.parents) {
-      if (args.depth !== undefined && distance + 1 >= args.depth) boundary.add(oid);
-      queue.push({ oid: parent, distance: distance + 1 });
-    }
+  // Roots of the commit walk, split by kind: a want naming a commit seeds the
+  // walk at distance 0, but a want naming a TAG seeds only the tag object
+  // itself — its target commit joins the walk only if the commit wants do not
+  // already reach it. Seeding a tag target at 0 as well would count it as a
+  // fresh tip: a `fetch --deepen=1` on a repo with an annotated tag on the
+  // parent then over-includes the grandparent and drops the shallow boundary
+  // (real git upload-pack behaves this way; verified against git 2.43).
+  const commitWants: string[] = [];
+  const tagCommitWants: string[] = [];
+  for (const oid of args.wants) {
+    const object = repo.objects.get(oid);
+    if (object?.type === 'tag') tagCommitWants.push(peelToCommit(oid, lookup));
+    else commitWants.push(peelToCommit(oid, lookup));
   }
+  const wantTags = args.wants.filter((oid) => repo.objects.get(oid)?.type === 'tag');
+  const wantObjects = args.wants.filter((oid) => {
+    const object = repo.objects.get(oid);
+    return object !== undefined && (object.type === 'blob' || object.type === 'tree');
+  });
+  // Distances from the walk roots, unlimited: the deepen-relative probe.
+  const walkDistances = (roots: { oid: string; distance: number }[]): Map<string, number> => {
+    const dist = new Map<string, number>();
+    const seen = new Set<string>();
+    const queue = [...roots];
+    while (queue.length > 0) {
+      const { oid, distance } = queue.shift()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      dist.set(oid, distance);
+      const object = lookup(oid);
+      if (!object || object.type !== 'commit') continue;
+      for (const parent of parseCommit(object.data).parents) queue.push({ oid: parent, distance: distance + 1 });
+    }
+    return dist;
+  };
+  let depthLimit = args.depth;
+  if (args.depth !== undefined && args.deepenRelative && args.shallow.length > 0) {
+    const dist = walkDistances(commitWants.map((oid) => ({ oid, distance: 0 })));
+    const extra = tagCommitWants.filter((oid) => !dist.has(oid)).map((oid) => ({ oid, distance: 0 }));
+    if (extra.length > 0) {
+      for (const [oid, d] of walkDistances(extra)) if (!dist.has(oid) || d < dist.get(oid)!) dist.set(oid, d);
+    }
+    let boundaryDepth = 0;
+    for (const oid of args.shallow) {
+      const d = dist.get(peelToCommit(oid, lookup));
+      if (d !== undefined && d > boundaryDepth) boundaryDepth = d;
+    }
+    depthLimit = boundaryDepth + args.depth + 1;
+  }
+  const included = new Set<string>();
+  const visited = new Set<string>();
+  const runBfs = (roots: { oid: string; distance: number }[]): void => {
+    const queue = [...roots];
+    while (queue.length > 0) {
+      const { oid, distance } = queue.shift()!;
+      if (visited.has(oid)) continue;
+      visited.add(oid);
+      const object = lookup(oid);
+      if (!object || object.type !== 'commit') continue;
+      if (depthLimit !== undefined && distance >= depthLimit) continue;
+      const commit = parseCommit(object.data);
+      if (args.deepenSince !== undefined && commit.timestamp < args.deepenSince) continue;
+      included.add(oid);
+      // Without a depth limit, the client's shallow boundary stops the walk:
+      // the client has that commit but not its parents, and sending the
+      // parents would silently un-shallow its repo (real git upload-pack
+      // treats the shallow lines as walk boundaries; verified against git
+      // 2.43 — a tag-following fetch after a deepen sends only the tag object,
+      // never the history behind the shallow boundary). With a deepen the
+      // depth limit governs instead (that is how the client extends past its
+      // boundary), so the stop applies only when no depth limit is set.
+      if (depthLimit === undefined && shallowSet.has(oid)) continue;
+      for (const parent of commit.parents) queue.push({ oid: parent, distance: distance + 1 });
+    }
+  };
+  runBfs(commitWants.map((oid) => ({ oid, distance: 0 })));
+  runBfs(tagCommitWants.filter((oid) => !visited.has(oid)).map((oid) => ({ oid, distance: 0 })));
   // Closure of haves, stopping at the shallow boundary (parents of a shallow commit stay hidden).
   const held = collectReachable(args.haves.map((oid) => peelToCommit(oid, lookup)), lookup, true, shallowSet);
+  for (const ref of args.deepenNot) {
+    const target = repo.refs.get(ref) ?? (isObjectId(ref) ? ref : undefined);
+    if (target) for (const oid of collectReachable([peelToCommit(target, lookup)], lookup, true, shallowSet)) held.add(oid);
+  }
   // Send each included commit plus its own tree closure only. A full closure over the
   // included set would follow parents and defeat depth limits, so the tree walk is
   // per-commit (trees reach only trees and blobs, never commits).
   const sendIds = new Set<string>();
   const send = new Set<string>(wantTags);
+  for (const oid of wantObjects) send.add(oid);
   for (const oid of included) {
     send.add(oid);
     const object = lookup(oid);
@@ -1023,14 +1113,71 @@ function fetchSelection(
       for (const treeOid of collectReachable([parseCommit(object.data).tree], lookup, true)) send.add(treeOid);
     }
   }
-  for (const oid of send) if (!held.has(oid)) sendIds.add(oid);
+  // `include-tag`: send the annotated tag objects whose target is being sent
+  // (or is already held — the client may lack the tag while holding the
+  // commit), without their history. Without this, a client that asked for
+  // tags does a second, depth-less tag fetch whose full closure completes
+  // the history and silently un-shallows a shallow clone.
+  if (args.includeTag) {
+    for (const [name, oid] of repo.refs) {
+      if (!name.startsWith('refs/tags/')) continue;
+      const object = repo.objects.get(oid);
+      if (!object || object.type !== 'tag') continue;
+      const target = peelToCommit(oid, lookup);
+      if (send.has(target) || held.has(target)) send.add(oid);
+    }
+  }
+  // A blob/tree named directly as a want (a promisor/lazy fetch after a
+  // filtered clone) is always sent, even when it is reachable from the haves:
+  // the client asked for that exact object because it does not have it, and
+  // the haves' closure wrongly counts it as held. Commit wants stay
+  // held-filtered (a fetch with the tip already held transfers nothing).
+  const directWants = new Set(wantObjects);
+  for (const oid of send) if (!held.has(oid) || directWants.has(oid)) sendIds.add(oid);
+  const filteredOut = (object: GitObject): boolean => {
+    const filter = args.filter;
+    if (filter === 'blob:none') return object.type === 'blob';
+    if (filter === 'tree:0') return object.type === 'blob' || object.type === 'tree';
+    if (filter.startsWith('blob:limit=')) {
+      const limit = parseInt(filter.slice('blob:limit='.length), 10);
+      return object.type === 'blob' && !Number.isNaN(limit) && object.data.length > limit;
+    }
+    if (filter.startsWith('object:type=')) return object.type !== filter.slice('object:type='.length);
+    return false;
+  };
   const objects: GitObject[] = [];
+  const sentIds = new Set<string>();
   for (const oid of [...sendIds].sort()) {
     const object = lookup(oid);
-    if (object) objects.push(object);
+    // A direct blob/tree want (a promisor/lazy fetch) is exempt from the
+    // partial-clone filter: the client re-sends `filter blob:none` on every
+    // fetch, and applying it to the very object it is asking for returns an
+    // empty pack ("did not send all necessary objects").
+    if (object && (directWants.has(oid) || !filteredOut(object))) { objects.push(object); sentIds.add(oid); }
   }
-  const shallow: string[] = args.depth !== undefined ? [...boundary].sort() : [];
-  const unshallow: string[] = args.shallow.filter((oid) => included.has(oid) && !boundary.has(oid));
+  // Shallow lines are the DEEPEST SENT commits: a sent commit whose parent is
+  // neither sent nor already held by the client (real git upload-pack,
+  // verified against git 2.43: `clone --depth 1` -> shallow=tip, `--depth 2`
+  // -> shallow=parent, `--shallow-since` -> shallow=deepest included commit).
+  // The excluded parent is NEVER the shallow line: reporting it makes the
+  // client treat a commit it never received as a boundary, then fail with
+  // "remote did not send all necessary objects" when it traverses the sent
+  // commit's parents. A plain fetch that sends nothing reports no shallow
+  // lines at all.
+  const shallow: string[] = [...sentIds].filter((oid) => {
+    const object = lookup(oid);
+    if (object?.type !== 'commit') return false;
+    return parseCommit(object.data).parents.some((p) => !sentIds.has(p) && !held.has(p));
+  }).sort();
+  // Unshallow: a previous shallow boundary whose parents are all present now
+  // (sent or held) is no longer a boundary. A plain fetch that sends nothing
+  // new unshallows nothing.
+  const unshallow: string[] = args.shallow.filter((oid) => {
+    const object = lookup(oid);
+    if (object?.type !== 'commit') return false;
+    const parents = parseCommit(object.data).parents;
+    return parents.length > 0 && parents.every((p) => sentIds.has(p) || held.has(p));
+  });
   return { send: objects, shallow, unshallow };
 }
 
@@ -1064,7 +1211,7 @@ function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
       }
       parts.push(Buffer.from('0001', 'ascii'));
     }
-    if (args.depth !== undefined || args.shallow.length > 0) {
+    if (args.depth !== undefined || args.shallow.length > 0 || args.deepenSince !== undefined || shallow.length > 0) {
       parts.push(encodePktLine('shallow-info\n'));
       for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
       for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
@@ -1075,11 +1222,29 @@ function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
     parts.push(Buffer.from('0000', 'ascii'));
     return Buffer.concat(parts);
   }
-  // v0: NAK/ACK lines, shallow/unshallow lines, then the sideband pack.
+  // v0 over HTTP is TWO posts when the client asks for shallow info (real git
+  // upload-pack, verified against git 2.43): the first carries the wants plus
+  // the deepen/shallow lines (no `done`) and gets only the shallow/unshallow
+  // lines plus a flush; the second repeats the wants with `done` (plus any
+  // haves) and gets the shallow lines again, a flush, then NAK/ACK and the
+  // pack. A plain fetch (no shallow request) is a SINGLE post with `done` and
+  // gets NAK/ACK + pack directly — a leading flush before the NAK makes the
+  // client fail with "expected ACK/NAK, got a flush packet", so the shallow
+  // section is emitted only when it has lines.
+  const hasShallowRequest = args.depth !== undefined || args.deepenSince !== undefined || args.deepenNot.length > 0 || args.deepenRelative || args.shallow.length > 0;
+  if (!args.hasDone && hasShallowRequest) {
+    for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    parts.push(Buffer.from('0000', 'ascii'));
+    return Buffer.concat(parts);
+  }
+  if (shallow.length > 0 || unshallow.length > 0) {
+    for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
+    parts.push(Buffer.from('0000', 'ascii'));
+  }
   if (common.length === 0) parts.push(encodePktLine('NAK\n'));
   else for (const oid of common) parts.push(encodePktLine(`ACK ${oid}\n`));
-  for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-  for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
   parts.push(sidebandPackets(pack));
   parts.push(Buffer.from('0000', 'ascii'));
   return Buffer.concat(parts);
@@ -1946,12 +2111,29 @@ class GqlParser {
     return name; // enum value, kept as its name
   }
 
-  private skipDirectives(): void {
+  /**
+   * Read directives after a field, fragment or operation, and say whether the
+   * item is included. @skip(if: true) drops it, @include(if: false) drops it;
+   * both may appear (either one excluding wins) and unknown directives are
+   * ignored. `if` may be a literal or a $variable (already resolved by
+   * readValue). Items are still fully parsed when excluded, so the parser
+   * position stays correct — only the built field is dropped.
+   */
+  private readDirectives(): boolean {
+    let include = true;
     while (this.peek() === '@') {
       this.pos += 1;
-      this.readName();
-      if (this.peek() === '(') this.readArguments();
+      const name = this.readName();
+      const args = this.peek() === '(' ? this.readArguments() : {};
+      if (name === 'skip' && args['if'] === true) include = false;
+      else if (name === 'include' && args['if'] !== true) include = false;
     }
+    return include;
+  }
+
+  /** Skip directives where inclusion is meaningless (operations, fragment definitions). */
+  private skipDirectives(): void {
+    this.readDirectives();
   }
 
   private readArguments(): Record<string, GqlValue> {
@@ -1994,14 +2176,14 @@ class GqlParser {
         if (this.text.startsWith('on', this.pos) && /[^A-Za-z0-9_]/.test(this.text[this.pos + 2] ?? ' ')) {
           this.pos += 2;
           const typeName = this.readName();
-          this.skipDirectives();
+          const include = this.readDirectives();
           const children = this.readSelectionSet();
-          fields.push({ alias: '', name: '', args: {}, children, fragments: [{ type: typeName, fields: children }] });
+          if (include) fields.push({ alias: '', name: '', args: {}, children, fragments: [{ type: typeName, fields: children }] });
         } else {
           // Fragment spread: name only; definitions are expanded by the caller.
           const spreadName = this.readName();
-          this.skipDirectives();
-          fields.push({ alias: '', name: '', args: {}, children: [], fragments: [{ type: `...${spreadName}`, fields: [] }] });
+          const include = this.readDirectives();
+          if (include) fields.push({ alias: '', name: '', args: {}, children: [], fragments: [{ type: `...${spreadName}`, fields: [] }] });
         }
         continue;
       }
@@ -2013,9 +2195,9 @@ class GqlParser {
         name = this.readName();
       }
       const args = this.peek() === '(' ? this.readArguments() : {};
-      this.skipDirectives();
+      const include = this.readDirectives();
       const children = this.peek() === '{' ? this.readSelectionSet() : [];
-      fields.push({ alias, name, args, children, fragments: [] });
+      if (include) fields.push({ alias, name, args, children, fragments: [] });
     }
     this.expect('}');
     return fields;
@@ -2712,20 +2894,64 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
       return;
     }
     if (first.startsWith('command=fetch')) {
-      const args: FetchArgs = { wants: [], haves: [], shallow: [], thinPack: false, noProgress: false, ofsDelta: false, filter: '' };
+      const args: FetchArgs = { wants: [], haves: [], shallow: [], deepenRelative: false, deepenNot: [], includeTag: false, hasDone: false, thinPack: false, noProgress: false, ofsDelta: false, filter: '' };
       for (const packet of lines.slice(1)) {
         const text = packet.payload.toString('utf8').trim();
         if (text.startsWith('want ')) args.wants.push(text.slice(5).trim());
         else if (text.startsWith('have ')) args.haves.push(text.slice(5).trim());
         else if (text.startsWith('shallow ')) args.shallow.push(text.slice(8).trim());
         else if (text.startsWith('deepen ')) args.depth = parseInt(text.slice(7).trim(), 10);
+        else if (text === 'deepen-relative') args.deepenRelative = true;
+        else if (text.startsWith('deepen-since ')) args.deepenSince = parseInt(text.slice('deepen-since '.length).trim(), 10);
+        else if (text.startsWith('deepen-not ')) args.deepenNot.push(text.slice('deepen-not '.length).trim());
+        else if (text === 'include-tag') args.includeTag = true;
         else if (text === 'thin-pack') args.thinPack = true;
         else if (text === 'no-progress') args.noProgress = true;
         else if (text === 'ofs-delta') args.ofsDelta = true;
         else if (text.startsWith('filter ')) args.filter = text.slice(7).trim();
-        else if (text === 'done') break;
+        else if (text === 'done') { args.hasDone = true; break; }
       }
       sendBytes(ctx, 200, handleFetch(repo, args, wantsV2), 'application/x-git-upload-pack-result');
+      return;
+    }
+    if (first.startsWith('want ')) {
+      // Protocol v0 fetch: `want <oid>[\\0caps]` lines, shallow/deepen lines, a
+      // flush, then `have` lines and `done`, a flush. v0 has no command= line;
+      // without this branch every v0 client (old git, protocol.version=0) got 400.
+      const args: FetchArgs = { wants: [], haves: [], shallow: [], deepenRelative: false, deepenNot: [], includeTag: false, hasDone: false, thinPack: false, noProgress: false, ofsDelta: false, filter: '' };
+      let afterFlush = false;
+      for (const packet of packets) {
+        if (packet.kind === 'flush' || packet.kind === 'delim') { afterFlush = true; continue; }
+        if (packet.kind !== 'data') continue;
+        const text = packet.payload.toString('utf8').trim();
+        if (afterFlush) {
+          if (text.startsWith('have ')) args.haves.push(text.slice(5).trim());
+          else if (text === 'done') args.hasDone = true;
+          continue;
+        }
+        // The first want line carries the capabilities after a SPACE (v0 puts
+        // them on the first want line, unlike receive-pack's NUL separator).
+        const line = text;
+        if (line.startsWith('want ')) {
+          const tokens = line.slice(5).trim().split(/\s+/);
+          args.wants.push(tokens[0]!);
+          // The first want line carries the client's capabilities after the
+          // oid. In v0 `deepen-relative` and `include-tag` are conveyed ONLY
+          // there (there is no separate line, unlike v2) — a `fetch
+          // --deepen=1` from a shallow clone sends `deepen 1` plus the
+          // `deepen-relative` cap, and missing it makes the server treat the
+          // deepen as absolute depth 1 (wrong shallow list, client dies with
+          // "expected shallow list").
+          if (tokens.slice(1).includes('include-tag')) args.includeTag = true;
+          if (tokens.slice(1).includes('deepen-relative')) args.deepenRelative = true;
+        }
+        else if (line.startsWith('shallow ')) args.shallow.push(line.slice(8).trim());
+        else if (line.startsWith('deepen ')) args.depth = parseInt(line.slice(7).trim(), 10);
+        else if (line === 'deepen-relative') args.deepenRelative = true;
+        else if (line.startsWith('deepen-since ')) args.deepenSince = parseInt(line.slice('deepen-since '.length).trim(), 10);
+        else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice('deepen-not '.length).trim());
+      }
+      sendBytes(ctx, 200, handleFetch(repo, args, false), 'application/x-git-upload-pack-result');
       return;
     }
     sendError(ctx, 400, 'unknown upload-pack command');
