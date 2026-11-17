@@ -968,7 +968,7 @@ function uploadPackAdvertisement(repo: Repo, wantsV2: boolean): { body: Buffer; 
   // and without `include-tag` it never asks for tag objects. `no-done` is
   // deliberately NOT advertised: the client still sends `done`, and omitting
   // it keeps the v0 two-post phase split unambiguous.
-  return advertisement(repo, 'git-upload-pack', `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed symref=HEAD:refs/heads/${repo.defaultBranch} object-format=sha1 agent=forge/1.0`, wantsV2);
+  return advertisement(repo, 'git-upload-pack', `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed symref=HEAD:refs/heads/${repo.defaultBranch} filter object-format=sha1 agent=forge/1.0`, wantsV2);
 }
 
 function receivePackAdvertisement(repo: Repo): { body: Buffer; type: string } {
@@ -1155,6 +1155,26 @@ function fetchSelection(
   // held-filtered (a fetch with the tip already held transfers nothing).
   const directWants = new Set(wantObjects);
   for (const oid of send) if (!held.has(oid) || directWants.has(oid)) sendIds.add(oid);
+  // Partial-clone filter exemption: a direct want (any type), a tag object,
+  // and the target of a sent tag object are always sent, even under a filter
+  // (real git upload-pack, verified against git 2.43 over HTTP: a
+  // --filter=object:type=commit clone still sends both tag objects plus the
+  // blob an annotated tag points at; object:type=tree still sends the tip
+  // commit and the annotated tag's target commit; object:type=blob still
+  // sends the tag targets. Only pure closure objects are filtered — a
+  // filtered pack that drops a wanted tag object makes the client fail the
+  // clone with "did not send all necessary objects").
+  const filterExempt = new Set<string>();
+  for (const oid of args.wants) if (repo.objects.has(oid)) filterExempt.add(oid);
+  const exemptTagTarget = (oid: string): void => {
+    const object = lookup(oid);
+    if (object?.type !== 'tag') return;
+    const target = parseTag(object.data).object;
+    if (target && !filterExempt.has(target)) { filterExempt.add(target); exemptTagTarget(target); }
+  };
+  for (const oid of send) {
+    if (lookup(oid)?.type === 'tag') { filterExempt.add(oid); exemptTagTarget(oid); }
+  }
   const filteredOut = (object: GitObject): boolean => {
     const filter = args.filter;
     if (filter === 'blob:none') return object.type === 'blob';
@@ -1173,13 +1193,21 @@ function fetchSelection(
     // A direct blob/tree want (a promisor/lazy fetch) is exempt from the
     // partial-clone filter: the client re-sends `filter blob:none` on every
     // fetch, and applying it to the very object it is asking for returns an
-    // empty pack ("did not send all necessary objects").
-    if (object && (directWants.has(oid) || !filteredOut(object))) { objects.push(object); sentIds.add(oid); }
+    // empty pack ("did not send all necessary objects"). So is any direct
+    // want, tag object, or tag target (see filterExempt above).
+    if (object && (filterExempt.has(oid) || !filteredOut(object))) { objects.push(object); sentIds.add(oid); }
   }
-  // Shallow lines are the DEEPEST SENT commits: a sent commit whose parent is
-  // neither sent nor already held by the client (real git upload-pack,
-  // verified against git 2.43: `clone --depth 1` -> shallow=tip, `--depth 2`
-  // -> shallow=parent, `--shallow-since` -> shallow=deepest included commit).
+  // Shallow lines are the DEEPEST SENT commits: a sent commit whose parent the
+  // walk did not reach and the client does not already hold (real git
+  // upload-pack, verified against git 2.43: `clone --depth 1` -> shallow=tip,
+  // `--depth 2` -> shallow=parent, `--shallow-since` -> shallow=deepest
+  // included commit). The test is on the WALK (`included`), not the pack
+  // (`sentIds`): a parent the walk reached but the partial-clone FILTER
+  // dropped from the pack is NOT a boundary — reporting it makes real git
+  // 2.43 mark the child shallow and immediately lazy-fetch it with
+  // `filter blob:none` (pulling the full closure — root commit + trees —
+  // into the clone), while the oracle's own --filter clone response carries
+  // NO shallow-info section at all and the client does no second fetch.
   // The excluded parent is NEVER the shallow line: reporting it makes the
   // client treat a commit it never received as a boundary, then fail with
   // "remote did not send all necessary objects" when it traverses the sent
@@ -1189,24 +1217,43 @@ function fetchSelection(
   // depth limit: oracle-verified vs git 2.43 — depth-1 on a 1-commit repo
   // lists the root as shallow, but depth-2 on the same repo and depth-5 on a
   // 3-commit repo do not (there the walk ended naturally, not at the limit).
-  const shallow: string[] = [...sentIds].filter((oid) => {
-    const object = lookup(oid);
-    if (object?.type !== 'commit') return false;
-    const parents = parseCommit(object.data).parents;
-    if (parents.some((p) => !sentIds.has(p) && !held.has(p))) return true;
-    return parents.length === 0 && depthLimit !== undefined && includedDist.get(oid) === depthLimit - 1;
-  }).sort();
-  // Unshallow: a previous shallow boundary whose parents are all present now
-  // (sent or held) is no longer a boundary. A plain fetch that sends nothing
-  // new unshallows nothing. A ROOT boundary has no parents, so its (empty)
-  // parent set is vacuously satisfied: oracle-verified vs git 2.43, a
-  // `fetch --unshallow` after deepen-to-the-root removes the shallow file.
-  const unshallow: string[] = args.shallow.filter((oid) => {
+  // A depth request ALSO re-shallows a boundary the client already holds:
+  // `fetch --depth=1` on a full clone must report the tip as shallow even
+  // though nothing is sent (real git upload-pack, verified against git 2.43).
+  // The boundary is any included commit whose parent the walk did not reach.
+  const hasDepthRequest = depthLimit !== undefined || args.deepenSince !== undefined || args.deepenRelative;
+  // Unshallow: a previous shallow boundary is unshallowed ONLY by a fetch
+  // that extends the depth past it (a deepen/deepen-since request). A plain
+  // or tag fetch that merely happens to send the boundary's parents does NOT
+  // unshallow it (real git upload-pack, verified against git 2.43: fetch
+  // --tags, fetch of another branch, and fetch of the parent sha all leave
+  // the shallow file untouched, while fetch --deepen=1 moves the boundary).
+  // A ROOT boundary has no parents, so its (empty) parent set is vacuously
+  // satisfied. A plain fetch that sends nothing new unshallows nothing.
+  const unshallow: string[] = hasDepthRequest ? args.shallow.filter((oid) => {
     const object = lookup(oid);
     if (object?.type !== 'commit') return false;
     const parents = parseCommit(object.data).parents;
     return parents.every((p) => sentIds.has(p) || held.has(p));
-  });
+  }) : [];
+  const unshallowSet = new Set(unshallow);
+  const shallowCandidates = new Set<string>();
+  for (const oid of sentIds) {
+    const object = lookup(oid);
+    if (object?.type !== 'commit') continue;
+    const parents = parseCommit(object.data).parents;
+    if (parents.some((p) => !included.has(p) && !held.has(p))) { shallowCandidates.add(oid); continue; }
+    if (parents.length === 0 && depthLimit !== undefined && includedDist.get(oid) === depthLimit - 1) shallowCandidates.add(oid);
+  }
+  if (hasDepthRequest) {
+    for (const oid of included) {
+      const object = lookup(oid);
+      if (object?.type !== 'commit') continue;
+      const parents = parseCommit(object.data).parents;
+      if (parents.length > 0 && parents.some((p) => !included.has(p))) shallowCandidates.add(oid);
+    }
+  }
+  const shallow: string[] = [...shallowCandidates].filter((oid) => !unshallowSet.has(oid)).sort();
   return { send: objects, shallow, unshallow };
 }
 
@@ -1305,7 +1352,14 @@ function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
   // client fail with "expected ACK/NAK, got a flush packet", so the shallow
   // section is emitted only when it has lines. (The two-post shallow case
   // returned above, before the pack cache was consulted.)
-  if (shallow.length > 0 || unshallow.length > 0) {
+  // The shallow section is sent on the pack post ONLY when the request
+  // carries a deepen (the second post of the two-post exchange). A
+  // single-post fetch that merely reports `shallow` lines (e.g. `fetch
+  // --tags` from a shallow clone) gets ACK/NAK + pack directly — sending a
+  // shallow section there makes real git fail with "expected ACK/NAK, got
+  // 'unshallow ...'" (verified against git 2.43).
+  const hasDepthRequest = args.depth !== undefined || args.deepenSince !== undefined || args.deepenRelative;
+  if (hasDepthRequest && (shallow.length > 0 || unshallow.length > 0)) {
     for (const oid of shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
     for (const oid of unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
     parts.push(Buffer.from('0000', 'ascii'));
@@ -2086,9 +2140,14 @@ interface GqlOperation {
 class GqlParser {
   private pos = 0;
   private readonly text: string;
-  private readonly variables: Record<string, GqlValue>;
+  // Variables actually supplied with the request. Per operation, `variables`
+  // is reset to the supplied variables overlaid on that operation's variable
+  // defaults (a supplied value — even explicit null — wins over its default).
+  private readonly providedVariables: Record<string, GqlValue>;
+  private variables: Record<string, GqlValue>;
   constructor(text: string, variables: Record<string, GqlValue>) {
     this.text = text;
+    this.providedVariables = variables;
     this.variables = variables;
   }
 
@@ -2223,21 +2282,46 @@ class GqlParser {
     return args;
   }
 
-  /** Skip a variable definition list (types are not enforced by this forge). */
-  private skipVariableDefinitions(): void {
+  /**
+   * Parse a variable definition list `($name: Type = default, ...)` and
+   * return the defaults it declares (types are not enforced by this forge).
+   * A default is a literal value read by readValue (string/number/boolean/
+   * null/enum/list/object). Without a default the variable resolves to null
+   * when not supplied, as before.
+   */
+  private skipVariableDefinitions(): Record<string, GqlValue> {
+    const defaults: Record<string, GqlValue> = {};
     this.skipWhitespace();
-    if (this.text[this.pos] !== '(') return;
-    let depth = 0;
-    while (this.pos < this.text.length) {
-      const char = this.text[this.pos++]!;
-      if (char === '(' || char === '[' || char === '{') depth += 1;
-      else if (char === ')' || char === ']' || char === '}') {
-        depth -= 1;
-        if (depth === 0) return;
-      } else if (char === '"') {
-        this.pos -= 1;
-        this.readString();
+    if (this.text[this.pos] !== '(') return defaults;
+    this.pos += 1;
+    for (;;) {
+      this.skipWhitespace();
+      const char = this.text[this.pos] ?? '';
+      if (char === ')') { this.pos += 1; return defaults; }
+      if (char === '') return defaults;
+      if (char === '$') {
+        this.pos += 1;
+        const name = this.readName();
+        this.skipWhitespace();
+        if (this.text[this.pos] === ':') this.pos += 1;
+        // Skip the type: names, `!`, and nested `[` `]` — until `=`, `,` or
+        // `)` at bracket depth 0.
+        let depth = 0;
+        while (this.pos < this.text.length) {
+          const c = this.text[this.pos]!;
+          if (c === '[') depth += 1;
+          else if (c === ']') depth -= 1;
+          else if (depth === 0 && (c === '=' || c === ',' || c === ')')) break;
+          this.pos += 1;
+        }
+        if (this.text[this.pos] === '=') {
+          this.pos += 1;
+          this.skipWhitespace();
+          defaults[name] = this.readValue();
+        }
+        continue;
       }
+      this.pos += 1;
     }
   }
 
@@ -2302,7 +2386,12 @@ class GqlParser {
       let name: string | undefined;
       this.skipWhitespace();
       if (/[A-Za-z_]/.test(this.text[this.pos] ?? '')) name = this.readName();
-      this.skipVariableDefinitions();
+      const defaults = this.skipVariableDefinitions();
+      // Effective variables for this operation: its defaults, with any
+      // supplied value (even explicit null) winning. The selection set is
+      // read after this assignment, so `$var` references in its arguments
+      // and directives resolve against the merged set.
+      this.variables = { ...defaults, ...this.providedVariables };
       this.skipDirectives();
       operations.push({ kind, name, variables: this.variables, fields: this.readSelectionSet() });
     }
@@ -2742,6 +2831,7 @@ function handleGraphql(ctx: ReqCtx): void {
     const record = asRecord(body);
     const query = typeof record.query === 'string' ? record.query : '';
     const variables = asRecord(record.variables);
+    const operationName = typeof record.operationName === 'string' ? record.operationName : undefined;
     if (!query) return { data: null, errors: [{ message: 'A query is required.' }] };
     let operations: GqlOperation[];
     try {
@@ -2749,7 +2839,18 @@ function handleGraphql(ctx: ReqCtx): void {
     } catch (err) {
       return { data: null, errors: [{ message: `GraphQL parse error: ${(err as Error).message}` }] };
     }
-    const operation = operations[0];
+    // Operation selection (GraphQL spec): a named operation runs when
+    // operationName names it; several operations without a name are an
+    // error; an unknown name is an error. Previously operations[0] always
+    // ran, so `operationName` was silently ignored.
+    let operation: GqlOperation | undefined;
+    if (operationName !== undefined) {
+      operation = operations.find((op) => op.name === operationName);
+      if (!operation) return { data: null, errors: [{ message: `Unknown operation named "${operationName}".` }] };
+    } else {
+      if (operations.length > 1) return { data: null, errors: [{ message: 'Must provide operation name if query contains multiple operations.' }] };
+      operation = operations[0];
+    }
     if (!operation) return { data: null, errors: [{ message: 'A query is required.' }] };
     const errors: { message: string }[] = [];
     const data = executeOperation(operation, errors);
@@ -2986,6 +3087,12 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
         else if (text.startsWith('filter ')) args.filter = text.slice(7).trim();
         else if (text === 'done') { args.hasDone = true; break; }
       }
+      // Real git upload-pack (2.43) dies on any `deepen-not` line
+      // ("ambiguous deepen-not") — `--shallow-exclude` always fails against
+      // it, on every transport and protocol version. Mirror that instead of
+      // treating the excluded refs as extra haves (which only fails the
+      // clone by accident when the excluded commit is on the fetched path).
+      if (args.deepenNot.length > 0) { sendError(ctx, 500, `ambiguous deepen-not: deepen-not ${args.deepenNot[0]}`); return; }
       sendBytes(ctx, 200, handleFetch(repo, args, wantsV2), 'application/x-git-upload-pack-result');
       return;
     }
@@ -3025,7 +3132,10 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
         else if (line === 'deepen-relative') args.deepenRelative = true;
         else if (line.startsWith('deepen-since ')) args.deepenSince = parseInt(line.slice('deepen-since '.length).trim(), 10);
         else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice('deepen-not '.length).trim());
+        else if (line.startsWith('filter ')) args.filter = line.slice(7).trim();
       }
+      // See the v2 branch: real git upload-pack dies on any `deepen-not`.
+      if (args.deepenNot.length > 0) { sendError(ctx, 500, `ambiguous deepen-not: deepen-not ${args.deepenNot[0]}`); return; }
       sendBytes(ctx, 200, handleFetch(repo, args, false), 'application/x-git-upload-pack-result');
       return;
     }
