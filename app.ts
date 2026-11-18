@@ -502,6 +502,17 @@ type Repo = {
   /** Memoized fetch packs, keyed by version + fetch args (capped, FIFO). */
   fetchCache: Map<string, CachedFetch>;
   /**
+   * Memoized whole upload-pack POST responses (ls-refs + fetch, v2 and v0),
+   * keyed by version + protocol flag + raw request bytes (capped, FIFO).
+   * The response is a pure function of (repo objects, repo refs, request
+   * bytes, protocol flag) — the same inputs the fetch-pack cache and the v0
+   * advertisement memo already key on — so a version match makes a stale
+   * hit impossible. Only 200 responses are stored; errors are never cached.
+   * Small request bodies only (<= 8 KiB): a fetch carrying hundreds of
+   * haves simply skips the cache instead of paying a huge key string.
+   */
+  uploadPackCache: Map<string, Buffer>;
+  /**
    * Memoized v0 advertisements (upload-pack / receive-pack), valid while
    * `version` matches: a v0 advertisement is a pure function of the repo's
    * refs + tag objects + default branch, and every mutation of those bumps
@@ -553,6 +564,7 @@ function createRepo(name: string, description = '', isPrivate = false): Repo {
     updatedSeq: seq,
     version: 0,
     fetchCache: new Map(),
+    uploadPackCache: new Map(),
   };
   store.repos.set(name, repo);
   return repo;
@@ -1320,6 +1332,16 @@ function fetchPack(repo: Repo, args: FetchArgs): CachedFetch {
   }
   repo.fetchCache.set(key, entry);
   return entry;
+}
+
+/** Store a whole upload-pack POST response, capped at 64 entries (FIFO). */
+function cacheUploadPack(repo: Repo, key: string, body: Buffer): void {
+  if (key === '' || body.length > 262144) return;
+  if (repo.uploadPackCache.size >= 64) {
+    const oldest = repo.uploadPackCache.keys().next().value;
+    if (oldest !== undefined) repo.uploadPackCache.delete(oldest);
+  }
+  repo.uploadPackCache.set(key, body);
 }
 
 function handleFetch(repo: Repo, args: FetchArgs, version2: boolean): Buffer {
@@ -3075,6 +3097,15 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
     return;
   }
   if (ctx.method === 'POST' && service === 'git-upload-pack') {
+    // Whole-response memo: the ls-refs / fetch answer repeats verbatim
+    // across clones of an unchanged repo, so a version + raw-bytes hit
+    // skips pkt-line decode, arg parsing, selection and framing entirely.
+    // The key is exact (latin1 maps bytes 1:1); errors are never stored.
+    const upKey = ctx.body.length <= 8192
+      ? `${repo.version}|${(ctx.req.headers['git-protocol'] ?? '') === 'version=2' ? 2 : 0}|${ctx.body.toString('latin1')}`
+      : '';
+    const upHit = upKey !== '' ? repo.uploadPackCache.get(upKey) : undefined;
+    if (upHit) { sendBytes(ctx, 200, upHit, 'application/x-git-upload-pack-result'); return; }
     let packets: Pkt[];
     try {
       packets = decodePktLines(ctx.body);
@@ -3094,7 +3125,9 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
         else if (text === 'unborn') args.unborn = true;
         else if (text.startsWith('ref-prefix ')) args.prefixes.push(text.slice('ref-prefix '.length));
       }
-      sendBytes(ctx, 200, handleLsRefs(repo, args), 'application/x-git-upload-pack-result');
+      const lsRefsOut = handleLsRefs(repo, args);
+      cacheUploadPack(repo, upKey, lsRefsOut);
+      sendBytes(ctx, 200, lsRefsOut, 'application/x-git-upload-pack-result');
       return;
     }
     if (first.startsWith('command=fetch')) {
@@ -3121,7 +3154,9 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
       // treating the excluded refs as extra haves (which only fails the
       // clone by accident when the excluded commit is on the fetched path).
       if (args.deepenNot.length > 0) { sendError(ctx, 500, `ambiguous deepen-not: deepen-not ${args.deepenNot[0]}`); return; }
-      sendBytes(ctx, 200, handleFetch(repo, args, wantsV2), 'application/x-git-upload-pack-result');
+      const fetchOut = handleFetch(repo, args, wantsV2);
+      cacheUploadPack(repo, upKey, fetchOut);
+      sendBytes(ctx, 200, fetchOut, 'application/x-git-upload-pack-result');
       return;
     }
     if (first.startsWith('want ')) {
@@ -3164,7 +3199,9 @@ function handleGit(ctx: ReqCtx, owner: string, repoName: string): void {
       }
       // See the v2 branch: real git upload-pack dies on any `deepen-not`.
       if (args.deepenNot.length > 0) { sendError(ctx, 500, `ambiguous deepen-not: deepen-not ${args.deepenNot[0]}`); return; }
-      sendBytes(ctx, 200, handleFetch(repo, args, false), 'application/x-git-upload-pack-result');
+      const fetchV0Out = handleFetch(repo, args, false);
+      cacheUploadPack(repo, upKey, fetchV0Out);
+      sendBytes(ctx, 200, fetchV0Out, 'application/x-git-upload-pack-result');
       return;
     }
     sendError(ctx, 400, 'unknown upload-pack command');
