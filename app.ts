@@ -501,6 +501,15 @@ type Repo = {
   version: number;
   /** Memoized fetch packs, keyed by version + fetch args (capped, FIFO). */
   fetchCache: Map<string, CachedFetch>;
+  /**
+   * Memoized v0 advertisements (upload-pack / receive-pack), valid while
+   * `version` matches: a v0 advertisement is a pure function of the repo's
+   * refs + tag objects + default branch, and every mutation of those bumps
+   * the version (see bumpRepoVersion call sites), so a stale hit is
+   * impossible. REST state never affects an advertisement.
+   */
+  advV0Up?: { version: number; body: Buffer; type: string };
+  advV0Rp?: { version: number; body: Buffer; type: string };
 };
 
 interface Store { repos: Map<string, Repo>; nextRepoId: number; seq: number }
@@ -962,17 +971,28 @@ function advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pac
   return { body: Buffer.concat([preamble, v0RefLines(repo, caps)]), type: `application/x-${service}-advertisement` };
 }
 
+// The v0 caps mirror real git upload-pack (git 2.43): without the deepen-*
+// caps a client refuses `--deepen` ("Server does not support --deepen"),
+// and without `include-tag` it never asks for tag objects. `no-done` is
+// deliberately NOT advertised: the client still sends `done`, and omitting
+// it keeps the v0 two-post phase split unambiguous.
 function uploadPackAdvertisement(repo: Repo, wantsV2: boolean): { body: Buffer; type: string } {
-  // The v0 caps mirror real git upload-pack (git 2.43): without the deepen-*
-  // caps a client refuses `--deepen` ("Server does not support --deepen"),
-  // and without `include-tag` it never asks for tag objects. `no-done` is
-  // deliberately NOT advertised: the client still sends `done`, and omitting
-  // it keeps the v0 two-post phase split unambiguous.
-  return advertisement(repo, 'git-upload-pack', `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed symref=HEAD:refs/heads/${repo.defaultBranch} filter object-format=sha1 agent=forge/1.0`, wantsV2);
+  // The v2 advertisement is constant (see V2_UPLOAD_PACK_ADVERTISEMENT);
+  // the v0 one is memoized per repo version (see Repo.advV0Up).
+  if (wantsV2) return { body: V2_UPLOAD_PACK_ADVERTISEMENT, type: V2_UPLOAD_PACK_ADVERTISEMENT_TYPE };
+  const cached = repo.advV0Up;
+  if (cached && cached.version === repo.version) return cached;
+  const built = advertisement(repo, 'git-upload-pack', `multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed symref=HEAD:refs/heads/${repo.defaultBranch} filter object-format=sha1 agent=forge/1.0`, false);
+  repo.advV0Up = { version: repo.version, body: built.body, type: built.type };
+  return repo.advV0Up;
 }
 
 function receivePackAdvertisement(repo: Repo): { body: Buffer; type: string } {
-  return advertisement(repo, 'git-receive-pack', 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0');
+  const cached = repo.advV0Rp;
+  if (cached && cached.version === repo.version) return cached;
+  const built = advertisement(repo, 'git-receive-pack', 'report-status side-band-64k delete-refs ofs-delta agent=forge/1.0');
+  repo.advV0Rp = { version: repo.version, body: built.body, type: built.type };
+  return repo.advV0Rp;
 }
 
 interface LsRefsArgs { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }
@@ -1475,6 +1495,14 @@ interface ReqCtx {
 }
 
 let requestCounter = 0;
+
+/**
+ * The v2 upload-pack advertisement is constant (same capability lines on
+ * every repo), so it is built once instead of re-encoded per info/refs GET.
+ * The buffer is never mutated downstream (sendBytes only reads it).
+ */
+const V2_UPLOAD_PACK_ADVERTISEMENT: Buffer = encodePktLines(['version 2\n', `agent=${AGENT}\n`, 'ls-refs=unborn\n', 'fetch=shallow filter include-tag\n', 'object-format=sha1\n', 'flush']);
+const V2_UPLOAD_PACK_ADVERTISEMENT_TYPE = 'application/x-git-upload-pack-advertisement';
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
